@@ -423,16 +423,28 @@ class QwenAdapter:
  
     def _headers(self) -> dict:
         h = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {self.token}",
-            "Origin": QWEN_BASE_URL,
+            "X-Request-Id": str(uuid.uuid4()),
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            "Accept": "application/json, text/plain, */*",
+            "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
             "Referer": f"{QWEN_BASE_URL}/",
-            "Accept": "*/*",
-            "Source": "web",
+            "Origin": QWEN_BASE_URL,
+            "Connection": "keep-alive",
+            "Content-Type": "application/json",
+            "sec-ch-ua": '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
+            "sec-ch-ua-mobile": "?0",
+            "sec-ch-ua-platform": '"Windows"',
+            "sec-fetch-dest": "empty",
+            "sec-fetch-mode": "cors",
+            "sec-fetch-site": "same-origin",
         }
+
+        if self.token:
+            h["Authorization"] = f"Bearer {self.token}"
+
         if self.cookies:
-            h["Cookie"] = self.cookies
+            h["cookies"] = self.cookies
+
         return h
  
     # ── Session management ───────────────────────────────────────────────
@@ -474,6 +486,11 @@ class QwenAdapter:
         feature_config: dict = {
             "thinking_enabled": thinking_enabled,
             "output_schema": "phase",
+            "research_mode": "normal",
+            "auto_thinking": True,
+            "thinking_mode": "Auto",
+            "thinking_format": "summary",
+            "auto_search": True,
         }
         if thinking_enabled:
             feature_config["thinking_budget"] = thinking_budget
@@ -481,7 +498,7 @@ class QwenAdapter:
         message = {
             "fid": msg_id,
             "parentId": parent_id,
-            "childrenIds": [],
+            "childrenIds": [str(uuid.uuid4())],
             "role": "user",
             "content": prompt,
             "user_action": "chat",
@@ -492,11 +509,11 @@ class QwenAdapter:
             "feature_config": feature_config,
             "extra": {"meta": {"subChatType": "search" if search_enabled else "t2t"}},
             "sub_chat_type": "search" if search_enabled else "t2t",
-            "parent_id": parent_id,
         }
  
         return {
             "stream": stream,
+            "version": "2.1",
             "incremental_output": True,
             "chat_id": chat_id,
             "chat_mode": "normal",
@@ -518,6 +535,7 @@ class QwenAdapter:
         model = model_type or DEFAULT_QWEN_MODEL
         body = self._build_body(chat_id, prompt, model, thinking_enabled,
                                  search_enabled, stream)
+
         url = f"{QWEN_BASE_URL}/api/v2/chat/completions?chat_id={chat_id}"
         if not stream:
             return self._client.post(url, json=body, headers=self._headers())
@@ -528,29 +546,16 @@ class QwenAdapter:
     def chat(self, session_id: str, prompt: str, model_type: str | None = None,
              thinking_enabled: bool = False, search_enabled: bool = False) -> str:
         """Send a non-streaming chat message, returns response content."""
-        resp = self._send_completion(session_id, prompt, stream=False,
-                                      model_type=model_type,
-                                      thinking_enabled=thinking_enabled,
-                                      search_enabled=search_enabled)
-        resp.raise_for_status()
-        data = resp.json()
- 
         content_parts = []
-        choices = data.get("choices") or []
-        for choice in choices:
-            msg = choice.get("message", {})
-            c = msg.get("content")
-            if isinstance(c, str):
-                content_parts.append(c)
-            elif isinstance(c, list):
-                for block in c:
-                    if isinstance(block, dict) and block.get("type") == "text":
-                        content_parts.append(block.get("text", ""))
- 
-        new_msg_id = (data.get("response.created", {}) or {}).get("id") or data.get("id")
-        if new_msg_id:
-            self._parent_ids[session_id] = new_msg_id
- 
+        for token in self.chat_stream(
+            session_id,
+            prompt,
+            model_type=model_type,
+            thinking_enabled=thinking_enabled,
+            search_enabled=search_enabled,
+        ):
+            if isinstance(token, str):
+                content_parts.append(token)
         return "".join(content_parts)
  
     # ── Streaming chat ───────────────────────────────────────────────────
@@ -569,6 +574,12 @@ class QwenAdapter:
                                      search_enabled=search_enabled)
         new_msg_id = None
         with ctx as resp:
+            resp.raise_for_status()
+            if resp.headers.get("content-type", "").startswith("application/json"):
+                resp.read()
+                data = resp.json()
+                if data.get("success") is False:
+                    raise RuntimeError(f"Qwen completion failed: {data}")
             for line in resp.iter_lines():
                 line = line.strip()
                 if not line:
