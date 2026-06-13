@@ -8,6 +8,8 @@ DSML — DeepSeek Markup Language 工具调用格式解析器
     </|DSML|invoke>
   </|DSML|tool_calls>
 """
+from __future__ import annotations
+
 import json
 import re
 import uuid

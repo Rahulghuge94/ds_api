@@ -27,7 +27,7 @@ import os
 import time
 import uuid
 from contextlib import asynccontextmanager
-from typing import Any, AsyncIterator, Optional
+from typing import Any, AsyncIterator, Literal, Optional
 
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, HTTPException, status
@@ -63,6 +63,7 @@ from ds_api.tool_sieve import StreamSieve
 
 ds_adapter: DeepSeekAdapter | None = None
 qw_adapter: QwenAdapter | None = None
+AdapterName = Literal["ds", "qwen"]
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -72,8 +73,8 @@ async def lifespan(app: FastAPI):
     yield
     if ds_adapter and ds_adapter._client:
         ds_adapter._client.close()
-    if qs_adapter and ds_adapter._client:
-        qs_adapter._client.close()
+    if qw_adapter and qw_adapter._client:
+        qw_adapter._client.close()
     
 app = FastAPI(
     title="DS/QW Proxy",
@@ -87,14 +88,16 @@ app = FastAPI(
 
 _bearer = HTTPBearer(auto_error=False)
 
-def _check_auth(creds: HTTPAuthorizationCredentials | None = Depends(_bearer)):
+def _check_auth(
+    creds: Optional[HTTPAuthorizationCredentials] = Depends(_bearer),
+):
     if not _API_KEY:
         return  # guard disabled
     if creds is None or creds.credentials != _API_KEY:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED,
                             detail="Invalid or missing API key")
 
-def _get_adapter(name: str) -> DeepSeekAdapter|QwenAdapter:
+def _get_adapter(name: AdapterName) -> DeepSeekAdapter | QwenAdapter:
     _adapter = qw_adapter if name == "qwen" else ds_adapter
     
     if _adapter is None:
@@ -109,6 +112,27 @@ def _model_to_ds(model: str) -> tuple[str | None, bool, bool]:
     if any(k in m for k in ("search", "online")):
         return None, False, True
     return None, False, False
+
+
+def _model_settings(
+    adapter_name: AdapterName,
+    model: str,
+) -> tuple[str | None, bool, bool]:
+    model_type, thinking_enabled, search_enabled = _model_to_ds(model)
+    if adapter_name == "qwen":
+        model_type = model if model.lower().startswith("qwen") else None
+    return model_type, thinking_enabled, search_enabled
+
+
+async def _create_session(
+    adapter_name: AdapterName,
+    model_type: str | None = None,
+) -> str:
+    adapter = _get_adapter(adapter_name)
+    if adapter_name == "qwen" and model_type:
+        return await _run_sync(adapter.create_session, model_type)
+    return await _run_sync(adapter.create_session)
+
 
 def _messages_to_prompt(messages: list[dict]) -> str:
     """Flatten an OpenAI-style messages list into a single prompt string."""
@@ -169,6 +193,7 @@ def _inject_tools(system: str | None, tools: list[dict] | None) -> str | None:
     return f"{system}\n\n{tool_prompt}" if system else tool_prompt
 
 async def _prepare_session(
+    adapter_name: AdapterName,
     messages: list[dict],
     system: str | None,
     tools: list[dict] | None,
@@ -178,12 +203,14 @@ async def _prepare_session(
     Build prompt + create DS session.
     Returns (session_id, prompt, model_type, thinking_enabled, search_enabled).
     """
-    model_type, thinking_enabled, search_enabled = _model_to_ds(model)
+    model_type, thinking_enabled, search_enabled = _model_settings(
+        adapter_name, model
+    )
     sys_prompt = _inject_tools(system, tools)
     if sys_prompt:
         messages = [{"role": "system", "content": sys_prompt}] + list(messages)
     prompt = _messages_to_prompt(messages)
-    session_id = await _run_sync(_get_adapter().create_session)
+    session_id = await _create_session(adapter_name, model_type)
     return session_id, prompt, model_type, thinking_enabled, search_enabled
 
 def _rand_id(prefix: str = "chatcmpl") -> str:
@@ -293,7 +320,7 @@ class ResponsesRequest(BaseModel):
 # ══════════════════════════════════════════════════════════════════════════════
 
 async def _token_queue(
-    adapter: DeepSeekAdapter,
+    adapter: DeepSeekAdapter | QwenAdapter,
     session_id: str,
     prompt: str,
     model_type: str | None,
@@ -323,11 +350,12 @@ async def _token_queue(
 
 
 async def _oai_stream_gen(
+    adapter_name: AdapterName,
     session_id: str, prompt: str, model: str,
     model_type: str | None, thinking_enabled: bool, search_enabled: bool,
     chat_id: str, has_tools: bool,
 ) -> AsyncIterator[str]:
-    adapter  = _get_adapter()
+    adapter  = _get_adapter(adapter_name)
     sieve    = StreamSieve(parse_fn=parse_dsml_tool_calls if has_tools else None)
     created  = int(time.time())
 
@@ -377,11 +405,12 @@ async def _oai_stream_gen(
 
 
 async def _anthropic_stream_gen(
+    adapter_name: AdapterName,
     session_id: str, prompt: str, model: str,
     model_type: str | None, thinking_enabled: bool, search_enabled: bool,
     msg_id: str, has_tools: bool,
 ) -> AsyncIterator[str]:
-    adapter = _get_adapter()
+    adapter = _get_adapter(adapter_name)
     sieve   = StreamSieve(parse_fn=parse_dsml_tool_calls if has_tools else None)
 
     yield _sse({"type": "message_start", "message": {
@@ -445,11 +474,12 @@ async def _anthropic_stream_gen(
 
 
 async def _codex_stream_gen(
+    adapter_name: AdapterName,
     session_id: str, prompt: str, model: str,
     model_type: str | None, thinking_enabled: bool, search_enabled: bool,
     cmpl_id: str, created: int,
 ) -> AsyncIterator[str]:
-    adapter = _get_adapter()
+    adapter = _get_adapter(adapter_name)
     q = await _token_queue(adapter, session_id, prompt,
                            model_type, thinking_enabled, search_enabled)
     while True:
@@ -471,6 +501,7 @@ async def _codex_stream_gen(
 
 
 async def _responses_stream_gen(
+    adapter_name: AdapterName,
     session_id: str, prompt: str, model: str,
     model_type: str | None, thinking_enabled: bool, search_enabled: bool,
     resp_id: str, has_tools: bool,
@@ -489,7 +520,7 @@ async def _responses_stream_gen(
       response.content_part.done
       response.completed
     """
-    adapter = _get_adapter()
+    adapter = _get_adapter(adapter_name)
     sieve   = StreamSieve(parse_fn=parse_dsml_tool_calls if has_tools else None)
     created = int(time.time())
 
@@ -618,8 +649,8 @@ async def _responses_stream_gen(
 
 
 
-@app.post("/v1/chat/completions", dependencies=[Depends(_check_auth)])
-async def oai_chat_completions(req: OAIChatRequest):
+@app.post("/{adapter_name}/v1/chat/completions", dependencies=[Depends(_check_auth)])
+async def oai_chat_completions(adapter_name: AdapterName, req: OAIChatRequest):
     """OpenAI Chat Completions — streaming and non-streaming with tool calls."""
     messages = [m.model_dump(exclude_none=True) for m in req.messages]
     tools_raw = (
@@ -631,18 +662,18 @@ async def oai_chat_completions(req: OAIChatRequest):
     non_sys = [m for m in messages if m["role"] != "system"]
 
     session_id, prompt, model_type, thinking, search = await _prepare_session(
-        non_sys, system, tools_raw, req.model
+        adapter_name, non_sys, system, tools_raw, req.model
     )
     chat_id = _rand_id("chatcmpl")
 
     if req.stream:
         return StreamingResponse(
-            _oai_stream_gen(session_id, prompt, req.model, model_type,
+            _oai_stream_gen(adapter_name, session_id, prompt, req.model, model_type,
                             thinking, search, chat_id, bool(tools_raw)),
             media_type="text/event-stream",
         )
 
-    raw = await _run_sync(_get_adapter().chat, session_id, prompt,
+    raw = await _run_sync(_get_adapter(adapter_name).chat, session_id, prompt,
                           model_type=model_type,
                           thinking_enabled=thinking,
                           search_enabled=search)
@@ -667,8 +698,8 @@ async def oai_chat_completions(req: OAIChatRequest):
 # Routes — Anthropic
 # ══════════════════════════════════════════════════════════════════════════════
 
-@app.post("/v1/messages", dependencies=[Depends(_check_auth)])
-async def anthropic_messages(req: AnthropicRequest):
+@app.post("/{adapter_name}/v1/messages", dependencies=[Depends(_check_auth)])
+async def anthropic_messages(adapter_name: AdapterName, req: AnthropicRequest):
     """Anthropic Messages API — streaming and non-streaming with tool_use blocks."""
     messages = [m.model_dump() for m in req.messages]
     tools_raw: list[dict] | None = None
@@ -680,18 +711,18 @@ async def anthropic_messages(req: AnthropicRequest):
         ]
 
     session_id, prompt, model_type, thinking, search = await _prepare_session(
-        messages, req.system, tools_raw, req.model
+        adapter_name, messages, req.system, tools_raw, req.model
     )
     msg_id = _rand_id("msg")
 
     if req.stream:
         return StreamingResponse(
-            _anthropic_stream_gen(session_id, prompt, req.model, model_type,
+            _anthropic_stream_gen(adapter_name, session_id, prompt, req.model, model_type,
                                   thinking, search, msg_id, bool(tools_raw)),
             media_type="text/event-stream",
         )
 
-    raw = await _run_sync(_get_adapter().chat, session_id, prompt,
+    raw = await _run_sync(_get_adapter(adapter_name).chat, session_id, prompt,
                           model_type=model_type,
                           thinking_enabled=thinking,
                           search_enabled=search)
@@ -723,24 +754,28 @@ async def anthropic_messages(req: AnthropicRequest):
 # Routes — Codex / legacy completions
 # ══════════════════════════════════════════════════════════════════════════════
 
-async def _codex_handler(req: CodexRequest, engine: str | None = None) -> Any:
+async def _codex_handler(
+    adapter_name: AdapterName,
+    req: CodexRequest,
+    engine: str | None = None,
+) -> Any:
     """Shared handler for /v1/completions and /v1/engines/{engine}/completions."""
     model = engine or req.model
-    model_type, thinking, search = _model_to_ds(model)
+    model_type, thinking, search = _model_settings(adapter_name, model)
 
     prompt_text = "\n".join(req.prompt) if isinstance(req.prompt, list) else str(req.prompt)
-    session_id  = await _run_sync(_get_adapter().create_session)
+    session_id  = await _create_session(adapter_name, model_type)
     cmpl_id     = _rand_id("cmpl")
     created     = int(time.time())
 
     if req.stream:
         return StreamingResponse(
-            _codex_stream_gen(session_id, prompt_text, model,
+            _codex_stream_gen(adapter_name, session_id, prompt_text, model,
                               model_type, thinking, search, cmpl_id, created),
             media_type="text/event-stream",
         )
 
-    text = await _run_sync(_get_adapter().chat, session_id, prompt_text,
+    text = await _run_sync(_get_adapter(adapter_name).chat, session_id, prompt_text,
                            model_type=model_type, thinking_enabled=thinking,
                            search_enabled=search)
     if req.echo:
@@ -756,16 +791,16 @@ async def _codex_handler(req: CodexRequest, engine: str | None = None) -> Any:
     })
 
 
-@app.post("/v1/completions", dependencies=[Depends(_check_auth)])
-async def completions(req: CodexRequest):
+@app.post("/{adapter_name}/v1/completions", dependencies=[Depends(_check_auth)])
+async def completions(adapter_name: AdapterName, req: CodexRequest):
     """Legacy /v1/completions endpoint (OpenAI text completion format)."""
-    return await _codex_handler(req)
+    return await _codex_handler(adapter_name, req)
 
 
-@app.post("/v1/engines/{engine}/completions", dependencies=[Depends(_check_auth)])
-async def codex_completions(engine: str, req: CodexRequest):
+@app.post("/{adapter_name}/v1/engines/{engine}/completions", dependencies=[Depends(_check_auth)])
+async def codex_completions(adapter_name: AdapterName, engine: str, req: CodexRequest):
     """Classic Codex endpoint: /v1/engines/{engine}/completions."""
-    return await _codex_handler(req, engine=engine)
+    return await _codex_handler(adapter_name, req, engine=engine)
 
 def _reasoning_to_ds(reasoning: dict | None) -> tuple[bool, str | None]:
     """Map reasoning.effort → (thinking_enabled, model_type override)."""
@@ -776,8 +811,8 @@ def _reasoning_to_ds(reasoning: dict | None) -> tuple[bool, str | None]:
         return True, "expert"
     return False, None
 
-@app.post("/v1/responses", dependencies=[Depends(_check_auth)])
-async def responses(req: ResponsesRequest):
+@app.post("/{adapter_name}/v1/responses", dependencies=[Depends(_check_auth)])
+async def responses(adapter_name: AdapterName, req: ResponsesRequest):
     """
     OpenAI Responses API — used by Codex CLI (openai-cli) and openai-python SDK v2+.
 
@@ -806,29 +841,30 @@ async def responses(req: ResponsesRequest):
 
     # reasoning.effort can force thinking mode independently of model name
     thinking_override, model_type_override = _reasoning_to_ds(req.reasoning)
-    model_type, thinking, search = _model_to_ds(req.model)
+    model_type, thinking, search = _model_settings(adapter_name, req.model)
     if thinking_override:
         thinking   = True
-        model_type = model_type_override or model_type
+        if adapter_name == "ds":
+            model_type = model_type_override or model_type
 
     sys_prompt = _inject_tools(req.instructions, tools_raw)
     if sys_prompt:
         messages = [{"role": "system", "content": sys_prompt}] + messages
 
     prompt     = _messages_to_prompt(messages)
-    session_id = await _run_sync(_get_adapter().create_session)
+    session_id = await _create_session(adapter_name, model_type)
     resp_id    = _rand_id("resp")
     created    = int(time.time())
 
     if req.stream:
         return StreamingResponse(
-            _responses_stream_gen(session_id, prompt, req.model, model_type,
+            _responses_stream_gen(adapter_name, session_id, prompt, req.model, model_type,
                                   thinking, search, resp_id, bool(tools_raw)),
             media_type="text/event-stream",
         )
 
     # ── Non-streaming ──────────────────────────────────────────────────────
-    raw = await _run_sync(_get_adapter().chat, session_id, prompt,
+    raw = await _run_sync(_get_adapter(adapter_name).chat, session_id, prompt,
                           model_type=model_type,
                           thinking_enabled=thinking,
                           search_enabled=search)
@@ -867,7 +903,7 @@ async def responses(req: ResponsesRequest):
 
 
 
-_MODELS = [
+_DS_MODELS = [
     {"id": "deepseek-chat",     "object": "model", "created": 0, "owned_by": "deepseek"},
     {"id": "deepseek-reasoner", "object": "model", "created": 0, "owned_by": "deepseek"},
     {"id": "deepseek-r1",       "object": "model", "created": 0, "owned_by": "deepseek"},
@@ -882,21 +918,34 @@ _MODELS = [
     {"id": "code-cushman-001",  "object": "model", "created": 0, "owned_by": "openai"},
 ]
 
+_QWEN_MODELS = [
+    {"id": "qwen3.7-plus", "object": "model", "created": 0, "owned_by": "qwen"},
+]
 
-@app.get("/v1/models", dependencies=[Depends(_check_auth)])
-async def list_models():
-    return JSONResponse({"object": "list", "data": _MODELS})
+def _models_for(adapter_name: AdapterName) -> list[dict]:
+    return _QWEN_MODELS if adapter_name == "qwen" else _DS_MODELS
 
-@app.get("/v1/models/{model_id}", dependencies=[Depends(_check_auth)])
-async def get_model(model_id: str):
-    for m in _MODELS:
+
+@app.get("/{adapter_name}/v1/models", dependencies=[Depends(_check_auth)])
+async def list_models(adapter_name: AdapterName):
+    return JSONResponse({"object": "list", "data": _models_for(adapter_name)})
+
+
+@app.get("/{adapter_name}/v1/models/{model_id}", dependencies=[Depends(_check_auth)])
+async def get_model(adapter_name: AdapterName, model_id: str):
+    for m in _models_for(adapter_name):
         if m["id"] == model_id:
             return JSONResponse(m)
     raise HTTPException(404, f"Model '{model_id}' not found")
 
-@app.get("/health")
-async def health():
-    return {"status": "ok", "adapter_ready": _adapter is not None}
+
+@app.get("/{adapter_name}/health")
+async def health(adapter_name: AdapterName):
+    return {
+        "status": "ok",
+        "adapter": adapter_name,
+        "adapter_ready": _get_adapter(adapter_name) is not None,
+    }
 
 
 if __name__ == "__main__":

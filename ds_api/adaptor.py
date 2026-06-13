@@ -2,6 +2,8 @@
 DeepSeek Chat API Adapter - WASM-based PoW solving, session management, streaming
 Supports expert mode (thinking_enabled, search_enabled).
 """
+from __future__ import annotations
+
 import json
 import os
 import time

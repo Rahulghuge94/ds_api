@@ -1,6 +1,21 @@
 # DeepSeek Proxy
 
-A FastAPI server that exposes DeepSeek Chat behind three drop-in API surfaces — OpenAI, Anthropic, and the OpenAI Responses API (used by Codex CLI) — with full DSML tool-call support and streaming on every route.
+A FastAPI server that exposes DeepSeek and Qwen Chat behind three drop-in API surfaces — OpenAI, Anthropic, and the OpenAI Responses API (used by Codex CLI) — with full DSML tool-call support and streaming on every route.
+
+## Adapter URLs
+
+The first URL segment selects the upstream adapter:
+
+- DeepSeek base URL: `http://{host}:{port}/ds`
+- Qwen base URL: `http://{host}:{port}/qwen`
+
+For example, OpenAI chat completions are available at:
+
+- `POST http://localhost:8000/ds/v1/chat/completions`
+- `POST http://localhost:8000/qwen/v1/chat/completions`
+
+The adapter URL decides which service receives the request. The request's
+`model` field controls model features within that adapter.
 
 ---
 
@@ -28,6 +43,8 @@ Create a `.env` or copy `.example.env` file in the same directory as `app.py`, o
 | Variable | Required | Default | Description |
 |---|---|---|---|
 | `DEEPSEEK_TOKEN` | yes | — | Bearer token from `chat.deepseek.com` (grab from browser DevTools → Network → Authorization header) |
+| `QWEN_TOKEN` | for Qwen | — | Bearer token from `chat.qwen.ai` |
+| `QWEN_COOKIES` | for Qwen | — | Session cookies from `chat.qwen.ai` |
 | `DEEPSEEK_COOKIES` | yes | — | Full cookie string from the same session |
 | `API_KEY` | no | *(empty)* | If set, every request must carry `Authorization: Bearer <API_KEY>`. Leave empty to disable the guard entirely. |
 | `WASM_PATH` | no | `sha3_wasm_bg.wasm` | Path to the SHA-3 WASM binary. Only needed if you move the file. |
@@ -66,12 +83,12 @@ Interactive docs are available at `http://localhost:8000/docs` once the server i
 
 ### OpenAI — Chat Completions
 
-`POST /v1/chat/completions`
+`POST /{adapter}/v1/chat/completions`
 
 Drop-in replacement for the OpenAI Chat Completions endpoint. Accepts the full OpenAI request shape and returns identical response envelopes.
 
 ```bash
-curl http://localhost:8000/v1/chat/completions \
+curl http://localhost:8000/ds/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
     "model": "deepseek-chat",
@@ -83,7 +100,7 @@ curl http://localhost:8000/v1/chat/completions \
 With tool calls:
 
 ```bash
-curl http://localhost:8000/v1/chat/completions \
+curl http://localhost:8000/ds/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
     "model": "deepseek-chat",
@@ -113,12 +130,12 @@ curl http://localhost:8000/v1/chat/completions \
 
 ### Anthropic — Messages API
 
-`POST /v1/messages`
+`POST /{adapter}/v1/messages`
 
 Drop-in replacement for the Anthropic Messages endpoint. Accepts Anthropic's request shape and returns `message` objects with `text` and `tool_use` content blocks.
 
 ```bash
-curl http://localhost:8000/v1/messages \
+curl http://localhost:8000/ds/v1/messages \
   -H "Content-Type: application/json" \
   -d '{
     "model": "deepseek-chat",
@@ -131,7 +148,7 @@ curl http://localhost:8000/v1/messages \
 With tools:
 
 ```bash
-curl http://localhost:8000/v1/messages \
+curl http://localhost:8000/ds/v1/messages \
   -H "Content-Type: application/json" \
   -d '{
     "model": "deepseek-chat",
@@ -173,12 +190,12 @@ print(response.content[0].text)
 
 ### OpenAI Responses API
 
-`POST /v1/responses`
+`POST /{adapter}/v1/responses`
 
 The stateful Responses API introduced in the `openai` Python SDK v2 and used by **Codex CLI** (`openai` CLI tool). This is the primary surface for agentic tool-use loops.
 
 ```bash
-curl http://localhost:8000/v1/responses \
+curl http://localhost:8000/ds/v1/responses \
   -H "Content-Type: application/json" \
   -d '{
     "model": "deepseek-chat",
@@ -190,7 +207,7 @@ curl http://localhost:8000/v1/responses \
 Multi-turn input array (SDK v2 format):
 
 ```bash
-curl http://localhost:8000/v1/responses \
+curl http://localhost:8000/ds/v1/responses \
   -H "Content-Type: application/json" \
   -d '{
     "model": "deepseek-chat",
@@ -205,7 +222,7 @@ curl http://localhost:8000/v1/responses \
 With `reasoning.effort` (forces thinking mode regardless of model name):
 
 ```bash
-curl http://localhost:8000/v1/responses \
+curl http://localhost:8000/ds/v1/responses \
   -H "Content-Type: application/json" \
   -d '{
     "model": "deepseek-chat",
@@ -244,13 +261,13 @@ print(response.output[0].content[0].text)
 
 ### Legacy Codex completions
 
-`POST /v1/completions`  
-`POST /v1/engines/{engine}/completions`
+`POST /{adapter}/v1/completions`
+`POST /{adapter}/v1/engines/{engine}/completions`
 
 For tooling that still uses the pre-chat completions format (older versions of GitHub Copilot plugins, direct Codex API integrations).
 
 ```bash
-curl http://localhost:8000/v1/completions \
+curl http://localhost:8000/ds/v1/completions \
   -H "Content-Type: application/json" \
   -d '{
     "model": "code-davinci-002",
@@ -263,7 +280,7 @@ curl http://localhost:8000/v1/completions \
 The classic engine path:
 
 ```bash
-curl http://localhost:8000/v1/engines/code-davinci-002/completions \
+curl http://localhost:8000/ds/v1/engines/code-davinci-002/completions \
   -H "Content-Type: application/json" \
   -d '{"prompt": "# Sort a list\n", "max_tokens": 100}'
 ```
@@ -276,9 +293,9 @@ Supports `echo` (prepend prompt to output) and `suffix` (append to output), matc
 
 | Method | Path | Description |
 |---|---|---|
-| `GET` | `/v1/models` | List all available model IDs |
-| `GET` | `/v1/models/{id}` | Get a single model record |
-| `GET` | `/health` | Liveness check — returns `{"status": "ok", "adapter_ready": true}` |
+| `GET` | `/{adapter}/v1/models` | List model IDs for the selected adapter |
+| `GET` | `/{adapter}/v1/models/{id}` | Get a model record for the selected adapter |
+| `GET` | `/{adapter}/health` | Liveness check for the selected adapter |
 
 ---
 
