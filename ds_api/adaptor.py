@@ -420,7 +420,8 @@ class QwenAdapter:
         # Track the parent (last assistant) message id per chat session, so
         # multi-turn conversations link correctly.
         self._parent_ids: dict[str, str | None] = {}
- 
+        self._chat_types = ["t2t", "search", "t2i", "t2v", "deep_research"]
+
     def _headers(self) -> dict:
         h = {
             "X-Request-Id": str(uuid.uuid4()),
@@ -479,6 +480,9 @@ class QwenAdapter:
         search_enabled: bool,
         stream: bool,
         thinking_budget: int = 38912,
+        generate_image: bool=False,
+        generate_video: bool=False,
+        deep_research: bool=False,
     ) -> dict:
         msg_id = uuid.uuid4().hex
         parent_id = self._parent_ids.get(chat_id)
@@ -492,9 +496,26 @@ class QwenAdapter:
             "thinking_format": "summary",
             "auto_search": True,
         }
-        if thinking_enabled:
-            feature_config["thinking_budget"] = thinking_budget
- 
+
+        # check if
+        chat_type = "t2t"
+        meta = {"subChatType": "t2t"}
+        if not generate_image and not generate_video and not deep_research and not search_enabled:
+            chat_type = "t2t"
+            
+        elif generate_image and not generate_video and not deep_research and not search_enabled:
+            chat_type = "t2i"
+            meta = {"subChatType": "t2i", "size": "16:9"}
+        elif generate_video and not generate_image and not deep_research and not search_enabled:
+            chat_type = "t2v"
+            meta = {"subChatType": "t2t", "size": "16:9"}
+        elif deep_research and not generate_image and not generate_video and not search_enabled:
+            chat_type = "deep_research"
+            meta = {"subChatType": "deep_research"}
+        elif search_enabled and not generate_image and not generate_video and not deep_research:
+            chat_type = "search"
+            meta = {"subChatType": "search"}
+
         message = {
             "fid": msg_id,
             "parentId": parent_id,
@@ -505,10 +526,10 @@ class QwenAdapter:
             "files": [],
             "timestamp": int(time.time()),
             "models": [model],
-            "chat_type": "search" if search_enabled else "t2t",
+            "chat_type": chat_type,
             "feature_config": feature_config,
-            "extra": {"meta": {"subChatType": "search" if search_enabled else "t2t"}},
-            "sub_chat_type": "search" if search_enabled else "t2t",
+            "extra": {"meta": meta},
+            "sub_chat_type": chat_type,
         }
  
         return {
