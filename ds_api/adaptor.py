@@ -6,6 +6,7 @@ import json
 import os
 import time
 import struct
+import uuid
 import base64
 import threading
 import httpx
@@ -13,10 +14,15 @@ from dotenv import load_dotenv
 from wasmtime import Store, Module, Instance
 
 load_dotenv()
-
+# deepseek conf
 COOKIES = os.environ.get("DEEPSEEK_COOKIES", "")
 BASE_URL = "https://chat.deepseek.com"
 TOKEN = os.environ.get("DEEPSEEK_TOKEN", "")
+# qwen conf
+QWEN_TOKEN = os.environ.get("QWEN_TOKEN", "")
+QWEN_COOKIES = os.environ.get("QWEN_COOKIES", "")
+QWEN_BASE_URL = "https://chat.qwen.ai"
+DEFAULT_QWEN_MODEL = "qwen3.7-plus"
 
 with open("ds_api/sha3_wasm_bg.wasm", "rb") as f:
     _WASM_BYTES = f.read()
@@ -401,3 +407,210 @@ class DeepSeekAdapter:
                 if p == "response/status":
                     yield {"__type": "status", "status": v}
                     continue
+
+class QwenAdapter:
+    """Adapter for chat.qwen.ai's internal chat completion API."""
+ 
+    def __init__(self, token: str = QWEN_TOKEN, cookies: str = QWEN_COOKIES):
+        self.token = token
+        self.cookies = cookies
+        self._client = httpx.Client(timeout=120)
+        # Track the parent (last assistant) message id per chat session, so
+        # multi-turn conversations link correctly.
+        self._parent_ids: dict[str, str | None] = {}
+ 
+    def _headers(self) -> dict:
+        h = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {self.token}",
+            "Origin": QWEN_BASE_URL,
+            "Referer": f"{QWEN_BASE_URL}/",
+            "Accept": "*/*",
+            "Source": "web",
+        }
+        if self.cookies:
+            h["Cookie"] = self.cookies
+        return h
+ 
+    # ── Session management ───────────────────────────────────────────────
+    def create_session(self, model: str = DEFAULT_QWEN_MODEL) -> str:
+        """Create a new chat session on chat.qwen.ai, returns chat_id."""
+        resp = self._client.post(
+            f"{QWEN_BASE_URL}/api/v2/chats/new",
+            json={"title": "New Chat", "models": [model], "chat_mode": "normal",
+                  "chat_type": "t2t", "timestamp": int(time.time() * 1000)},
+            headers=self._headers(),
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        chat_id = (
+            data.get("data", {}).get("id")
+            or data.get("data", {}).get("chat", {}).get("id")
+            or data.get("id")
+        )
+        if not chat_id:
+            raise RuntimeError(f"Qwen session creation failed: {data}")
+        self._parent_ids[chat_id] = None
+        return chat_id
+ 
+    # ── Request body construction ────────────────────────────────────────
+ 
+    def _build_body(
+        self,
+        chat_id: str,
+        prompt: str,
+        model: str,
+        thinking_enabled: bool,
+        search_enabled: bool,
+        stream: bool,
+        thinking_budget: int = 38912,
+    ) -> dict:
+        msg_id = uuid.uuid4().hex
+        parent_id = self._parent_ids.get(chat_id)
+ 
+        feature_config: dict = {
+            "thinking_enabled": thinking_enabled,
+            "output_schema": "phase",
+        }
+        if thinking_enabled:
+            feature_config["thinking_budget"] = thinking_budget
+ 
+        message = {
+            "fid": msg_id,
+            "parentId": parent_id,
+            "childrenIds": [],
+            "role": "user",
+            "content": prompt,
+            "user_action": "chat",
+            "files": [],
+            "timestamp": int(time.time()),
+            "models": [model],
+            "chat_type": "search" if search_enabled else "t2t",
+            "feature_config": feature_config,
+            "extra": {"meta": {"subChatType": "search" if search_enabled else "t2t"}},
+            "sub_chat_type": "search" if search_enabled else "t2t",
+            "parent_id": parent_id,
+        }
+ 
+        return {
+            "stream": stream,
+            "incremental_output": True,
+            "chat_id": chat_id,
+            "chat_mode": "normal",
+            "model": model,
+            "parent_id": parent_id,
+            "messages": [message],
+            "timestamp": int(time.time()),
+        }
+ 
+    def _send_completion(
+        self,
+        chat_id: str,
+        prompt: str,
+        stream: bool,
+        model_type: str | None,
+        thinking_enabled: bool,
+        search_enabled: bool,
+    ):
+        model = model_type or DEFAULT_QWEN_MODEL
+        body = self._build_body(chat_id, prompt, model, thinking_enabled,
+                                 search_enabled, stream)
+        url = f"{QWEN_BASE_URL}/api/v2/chat/completions?chat_id={chat_id}"
+        if not stream:
+            return self._client.post(url, json=body, headers=self._headers())
+        return self._client.stream("POST", url, json=body, headers=self._headers())
+ 
+    # ── Non-streaming chat ───────────────────────────────────────────────
+ 
+    def chat(self, session_id: str, prompt: str, model_type: str | None = None,
+             thinking_enabled: bool = False, search_enabled: bool = False) -> str:
+        """Send a non-streaming chat message, returns response content."""
+        resp = self._send_completion(session_id, prompt, stream=False,
+                                      model_type=model_type,
+                                      thinking_enabled=thinking_enabled,
+                                      search_enabled=search_enabled)
+        resp.raise_for_status()
+        data = resp.json()
+ 
+        content_parts = []
+        choices = data.get("choices") or []
+        for choice in choices:
+            msg = choice.get("message", {})
+            c = msg.get("content")
+            if isinstance(c, str):
+                content_parts.append(c)
+            elif isinstance(c, list):
+                for block in c:
+                    if isinstance(block, dict) and block.get("type") == "text":
+                        content_parts.append(block.get("text", ""))
+ 
+        new_msg_id = (data.get("response.created", {}) or {}).get("id") or data.get("id")
+        if new_msg_id:
+            self._parent_ids[session_id] = new_msg_id
+ 
+        return "".join(content_parts)
+ 
+    # ── Streaming chat ───────────────────────────────────────────────────
+ 
+    def chat_stream(self, session_id: str, prompt: str,
+                    model_type: str | None = None,
+                    thinking_enabled: bool = False, search_enabled: bool = False):
+        """Stream a chat message, yields content tokens.
+ 
+        Mirrors DeepSeekAdapter.chat_stream: yields plain strings for content
+        tokens, and dicts with __type='thinking'/'status' for metadata.
+        """
+        ctx = self._send_completion(session_id, prompt, stream=True,
+                                     model_type=model_type,
+                                     thinking_enabled=thinking_enabled,
+                                     search_enabled=search_enabled)
+        new_msg_id = None
+        with ctx as resp:
+            for line in resp.iter_lines():
+                line = line.strip()
+                if not line:
+                    continue
+                if not line.startswith("data:"):
+                    continue
+ 
+                data_str = line[5:].strip()
+                if not data_str or data_str == "[DONE]":
+                    continue
+ 
+                try:
+                    data = json.loads(data_str)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(data, dict):
+                    continue
+ 
+                if not new_msg_id:
+                    new_msg_id = data.get("response.created", {}).get("id") if isinstance(
+                        data.get("response.created"), dict) else data.get("id")
+ 
+                choices = data.get("choices") or []
+                for choice in choices:
+                    delta = choice.get("delta", {})
+                    phase = delta.get("phase")
+                    content = delta.get("content")
+ 
+                    if content is None:
+                        continue
+ 
+                    if phase == "think":
+                        if content:
+                            yield {"__type": "thinking", "content": content}
+                        continue
+ 
+                    if phase == "answer" or phase is None:
+                        if content:
+                            yield content
+                        continue
+ 
+                    # Other phases (e.g. "tool_call") surfaced as status events
+                    if content:
+                        yield {"__type": "status", "status": phase}
+ 
+        if new_msg_id:
+            self._parent_ids[session_id] = new_msg_id

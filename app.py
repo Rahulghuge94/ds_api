@@ -54,27 +54,31 @@ import ds_api.adaptor as _adaptor_mod
 with open(_WASM_PATH, "rb") as _wf:
     _adaptor_mod._WASM_BYTES = _wf.read()
 
-from ds_api.adaptor import DeepSeekAdapter          # noqa: E402
-from ds_api.tool_dsml import (                       # noqa: E402
+from ds_api.adaptor import DeepSeekAdapter, QwenAdapter
+from ds_api.tool_dsml import (                       
     parse_dsml_tool_calls,
     build_dsml_tool_prompt,
 )
-from ds_api.tool_sieve import StreamSieve            # noqa: E402
+from ds_api.tool_sieve import StreamSieve            
 
-_adapter: DeepSeekAdapter | None = None
+ds_adapter: DeepSeekAdapter | None = None
+qw_adapter: QwenAdapter | None = None
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _adapter
-    _adapter = DeepSeekAdapter()
+    global ds_adapter, qw_adapter
+    ds_adapter = DeepSeekAdapter()
+    qw_adapter = QwenAdapter()
     yield
-    if _adapter and _adapter._client:
-        _adapter._client.close()
-
+    if ds_adapter and ds_adapter._client:
+        ds_adapter._client.close()
+    if qs_adapter and ds_adapter._client:
+        qs_adapter._client.close()
+    
 app = FastAPI(
-    title="DS Proxy",
+    title="DS/QW Proxy",
     description=(
-        "OpenAI / Anthropic / Codex compatible interface over DS Chat "
+        "OpenAI / Anthropic / Codex compatible interface over DS/QW Chat "
         "with DSML tool-call support."
     ),
     version="1.0.0",
@@ -90,7 +94,9 @@ def _check_auth(creds: HTTPAuthorizationCredentials | None = Depends(_bearer)):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED,
                             detail="Invalid or missing API key")
 
-def _get_adapter() -> DeepSeekAdapter:
+def _get_adapter(name: str) -> DeepSeekAdapter|QwenAdapter:
+    _adapter = qw_adapter if name == "qwen" else ds_adapter
+    
     if _adapter is None:
         raise HTTPException(500, "Adapter not initialised")
     return _adapter
