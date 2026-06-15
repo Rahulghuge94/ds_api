@@ -22,6 +22,7 @@ Environment variables (or .env file):
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 import time
@@ -64,6 +65,10 @@ from ds_api.tool_sieve import StreamSieve
 ds_adapter: DeepSeekAdapter | None = None
 qw_adapter: QwenAdapter | None = None
 AdapterName = Literal["ds", "qwen"]
+
+_session_lock = asyncio.Lock()
+_session_by_key: dict[str, str] = {}
+_session_by_response_id: dict[str, str] = {}
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -132,6 +137,83 @@ async def _create_session(
     if adapter_name == "qwen" and model_type:
         return await _run_sync(adapter.create_session, model_type)
     return await _run_sync(adapter.create_session)
+
+
+def _stable_hash(value: Any) -> str:
+    raw = json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:32]
+
+
+def _conversation_key(
+    adapter_name: AdapterName,
+    surface: str,
+    model: str,
+    first_user_text: str,
+    system: str | None = None,
+    explicit_id: str | None = None,
+) -> str | None:
+    if explicit_id:
+        return f"{adapter_name}:{surface}:explicit:{explicit_id}"
+    if not first_user_text:
+        return None
+    return f"{adapter_name}:{surface}:{_stable_hash({
+        'model': model,
+        'system': system or '',
+        'first_user': first_user_text,
+    })}"
+
+
+def _first_user_text(messages: list[dict]) -> str:
+    for msg in messages:
+        if msg.get("role") == "user":
+            return _content_to_text(msg.get("content"))
+    return _content_to_text(messages[0].get("content")) if messages else ""
+
+
+def _tail_since_last_assistant(messages: list[dict]) -> list[dict]:
+    """When an upstream session already has history, forward only new turns."""
+    for idx in range(len(messages) - 1, -1, -1):
+        if messages[idx].get("role") == "assistant":
+            tail = messages[idx + 1:]
+            return tail or messages[-1:]
+    return messages
+
+
+async def _resolve_session(
+    adapter_name: AdapterName,
+    model_type: str | None,
+    session_key: str | None = None,
+    previous_response_id: str | None = None,
+) -> tuple[str, bool]:
+    async with _session_lock:
+        if previous_response_id:
+            session_id = _session_by_response_id.get(previous_response_id)
+            if session_id:
+                return session_id, False
+        if session_key:
+            session_id = _session_by_key.get(session_key)
+            if session_id:
+                return session_id, False
+
+    session_id = await _create_session(adapter_name, model_type)
+
+    async with _session_lock:
+        if session_key:
+            existing = _session_by_key.setdefault(session_key, session_id)
+            if existing != session_id:
+                return existing, False
+    return session_id, True
+
+
+async def _remember_response_session(
+    response_id: str,
+    session_id: str,
+    session_key: str | None = None,
+) -> None:
+    async with _session_lock:
+        _session_by_response_id[response_id] = session_id
+        if session_key:
+            _session_by_key[session_key] = session_id
 
 
 def _content_to_text(content: Any) -> str:
@@ -208,20 +290,37 @@ async def _prepare_session(
     system: str | None,
     tools: list[dict] | None,
     model: str,
-) -> tuple[str, str, str | None, bool, bool]:
+    surface: str,
+    session_hint: str | None = None,
+    previous_response_id: str | None = None,
+) -> tuple[str, str, str | None, bool, bool, str | None]:
     """
-    Build prompt + create DS session.
-    Returns (session_id, prompt, model_type, thinking_enabled, search_enabled).
+    Build prompt + resolve DS/QW session.
+    Returns (session_id, prompt, model_type, thinking_enabled, search_enabled, session_key).
     """
     model_type, thinking_enabled, search_enabled = _model_settings(
         adapter_name, model
     )
     sys_prompt = _inject_tools(system, tools)
-    if sys_prompt:
-        messages = [{"role": "system", "content": sys_prompt}] + list(messages)
-    prompt = _messages_to_prompt(messages)
-    session_id = await _create_session(adapter_name, model_type)
-    return session_id, prompt, model_type, thinking_enabled, search_enabled
+    session_key = _conversation_key(
+        adapter_name, surface, model, _first_user_text(messages), sys_prompt, session_hint
+    )
+    session_id, is_new_session = await _resolve_session(
+        adapter_name, model_type, session_key, previous_response_id
+    )
+    prompt_messages = list(messages) if is_new_session else _tail_since_last_assistant(messages)
+    if sys_prompt and is_new_session:
+        prompt_messages = [{"role": "system", "content": sys_prompt}] + prompt_messages
+    prompt = _messages_to_prompt(prompt_messages)
+    return session_id, prompt, model_type, thinking_enabled, search_enabled, session_key
+
+
+def _request_session_hint(req: BaseModel) -> str | None:
+    for name in ("session_id", "chat_id", "conversation_id"):
+        value = getattr(req, name, None)
+        if value:
+            return str(value)
+    return None
 
 def _rand_id(prefix: str = "chatcmpl") -> str:
     return f"{prefix}-{uuid.uuid4().hex[:24]}"
@@ -259,6 +358,9 @@ class OAIChatRequest(BaseModel):
     tools: Optional[list[OAITool]] = None
     tool_choice: Optional[Any] = None
     system: Optional[str] = None   # convenience alias
+    session_id: Optional[str] = None
+    chat_id: Optional[str] = None
+    conversation_id: Optional[str] = None
 
 
 # ─ Anthropic ─────────────────────────────────────────────────────────────────
@@ -282,6 +384,9 @@ class AnthropicRequest(BaseModel):
     tools: Optional[list[AnthropicTool]] = None
     stream: Optional[bool] = False
     temperature: Optional[float] = None
+    session_id: Optional[str] = None
+    chat_id: Optional[str] = None
+    conversation_id: Optional[str] = None
 
 
 # ─ Codex / legacy ────────────────────────────────────────────────────────────
@@ -295,6 +400,9 @@ class CodexRequest(BaseModel):
     stop: Optional[Any] = None
     echo: bool = False
     suffix: Optional[str] = None
+    session_id: Optional[str] = None
+    chat_id: Optional[str] = None
+    conversation_id: Optional[str] = None
 
 
 # ─ Responses API (OpenAI Responses / Codex CLI) ──────────────────────────────
@@ -320,9 +428,12 @@ class ResponsesRequest(BaseModel):
     stream: Optional[bool] = False
     temperature: Optional[float] = None
     max_output_tokens: Optional[int] = None
-    previous_response_id: Optional[str] = None   # stateful chaining (ignored here)
+    previous_response_id: Optional[str] = None   # stateful chaining
     tool_choice: Optional[Any] = None
     reasoning: Optional[dict] = None             # {"effort": "low"|"medium"|"high"}
+    session_id: Optional[str] = None
+    chat_id: Optional[str] = None
+    conversation_id: Optional[str] = None
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -671,10 +782,12 @@ async def oai_chat_completions(adapter_name: AdapterName, req: OAIChatRequest):
     )
     non_sys = [m for m in messages if m["role"] != "system"]
 
-    session_id, prompt, model_type, thinking, search = await _prepare_session(
-        adapter_name, non_sys, system, tools_raw, req.model
+    session_id, prompt, model_type, thinking, search, session_key = await _prepare_session(
+        adapter_name, non_sys, system, tools_raw, req.model, "chat",
+        session_hint=_request_session_hint(req),
     )
     chat_id = _rand_id("chatcmpl")
+    await _remember_response_session(chat_id, session_id, session_key)
 
     if req.stream:
         return StreamingResponse(
@@ -719,10 +832,12 @@ async def anthropic_messages(adapter_name: AdapterName, req: AnthropicRequest):
                           "parameters": t.input_schema}}
             for t in req.tools
         ]
-    session_id, prompt, model_type, thinking, search = await _prepare_session(
-        adapter_name, messages, _content_to_text(req.system), tools_raw, req.model
+    session_id, prompt, model_type, thinking, search, session_key = await _prepare_session(
+        adapter_name, messages, _content_to_text(req.system), tools_raw, req.model,
+        "anthropic", session_hint=_request_session_hint(req),
     )
     msg_id = _rand_id("msg")
+    await _remember_response_session(msg_id, session_id, session_key)
 
     if req.stream:
         return StreamingResponse(
@@ -773,9 +888,13 @@ async def _codex_handler(
     model_type, thinking, search = _model_settings(adapter_name, model)
 
     prompt_text = "\n".join(req.prompt) if isinstance(req.prompt, list) else str(req.prompt)
-    session_id  = await _create_session(adapter_name, model_type)
+    session_key = _conversation_key(
+        adapter_name, "completions", model, prompt_text, explicit_id=_request_session_hint(req)
+    )
+    session_id, _ = await _resolve_session(adapter_name, model_type, session_key)
     cmpl_id     = _rand_id("cmpl")
     created     = int(time.time())
+    await _remember_response_session(cmpl_id, session_id, session_key)
 
     if req.stream:
         return StreamingResponse(
@@ -857,13 +976,21 @@ async def responses(adapter_name: AdapterName, req: ResponsesRequest):
             model_type = model_type_override or model_type
 
     sys_prompt = _inject_tools(req.instructions, tools_raw)
-    if sys_prompt:
-        messages = [{"role": "system", "content": sys_prompt}] + messages
+    session_key = _conversation_key(
+        adapter_name, "responses", req.model, _first_user_text(messages), sys_prompt,
+        explicit_id=_request_session_hint(req),
+    )
+    session_id, is_new_session = await _resolve_session(
+        adapter_name, model_type, session_key, req.previous_response_id
+    )
+    prompt_messages = list(messages) if is_new_session else _tail_since_last_assistant(messages)
+    if sys_prompt and is_new_session:
+        prompt_messages = [{"role": "system", "content": sys_prompt}] + prompt_messages
 
-    prompt     = _messages_to_prompt(messages)
-    session_id = await _create_session(adapter_name, model_type)
+    prompt     = _messages_to_prompt(prompt_messages)
     resp_id    = _rand_id("resp")
     created    = int(time.time())
+    await _remember_response_session(resp_id, session_id, session_key)
 
     if req.stream:
         return StreamingResponse(

@@ -1,12 +1,11 @@
-# Codex client configuration for local DS/QW Proxy
-# Use this with tools that expect a `config.toml` for Codex/OpenAI CLI integration.
+model = "qwen3.7-plus"
+model_provider = "qwen"
 
-[openai]
-api_key = "any"
-base_url = "http://localhost:8000/ds/v1"
-# If the server is configured to require a key, set that same key here.
-# Example:
-# api_key = "your-secret-key"
+[model_providers.qwen]
+name = "Qwen Custom Endpoint"
+base_url = "http://localhost:8000/qwen/v1"
+# if you have set the env variable then turn on or use direct header below
+# env_key = "x-api-key"
 
 [headers]
 # Some clients may support custom headers via config. If so, include:
