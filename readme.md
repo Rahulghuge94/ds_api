@@ -239,7 +239,7 @@ Thinking tokens from DeepSeek expert mode are surfaced as `response.reasoning_su
 
 ```bash
 OPENAI_API_KEY=any \
-OPENAI_BASE_URL=http://localhost:8000 \
+OPENAI_BASE_URL=http://localhost:8000/ds/v1 \
 codex "Explain this codebase"
 ```
 
@@ -248,7 +248,7 @@ codex "Explain this codebase"
 ```python
 from openai import OpenAI
 
-client = OpenAI(api_key="any", base_url="http://localhost:8000")
+client = OpenAI(api_key="any", base_url="http://localhost:8000/ds/v1")
 
 response = client.responses.create(
     model="deepseek-chat",

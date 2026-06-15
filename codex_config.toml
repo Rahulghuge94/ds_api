@@ -3,7 +3,7 @@
 
 [openai]
 api_key = "any"
-base_url = "http://localhost:8000"
+base_url = "http://localhost:8000/ds/v1"
 # If the server is configured to require a key, set that same key here.
 # Example:
 # api_key = "your-secret-key"

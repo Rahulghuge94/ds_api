@@ -193,7 +193,7 @@ def _responses_input_to_messages(inp: Any, ) -> list[dict]:
     return msgs
 
 async def _run_sync(fn, *args, **kwargs):
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     return await loop.run_in_executor(None, lambda: fn(*args, **kwargs))
 
 def _inject_tools(system: str | None, tools: list[dict] | None) -> str | None:
@@ -337,9 +337,9 @@ async def _token_queue(
     thinking_enabled: bool,
     search_enabled: bool,
 ) -> asyncio.Queue:
-    """Spin a thread-based producer; return a filled queue."""
+    """Spin a thread-based producer; return a live async queue."""
     q: asyncio.Queue[Any] = asyncio.Queue()
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
 
     def _produce():
         try:
@@ -349,13 +349,13 @@ async def _token_queue(
                 thinking_enabled=thinking_enabled,
                 search_enabled=search_enabled,
             ):
-                q.put_nowait(tok)
+                loop.call_soon_threadsafe(q.put_nowait, tok)
         except Exception as exc:
-            q.put_nowait(exc)
+            loop.call_soon_threadsafe(q.put_nowait, exc)
         finally:
-            q.put_nowait(None)
+            loop.call_soon_threadsafe(q.put_nowait, None)
 
-    await loop.run_in_executor(None, _produce)
+    loop.run_in_executor(None, _produce)
     return q
 
 
@@ -719,7 +719,6 @@ async def anthropic_messages(adapter_name: AdapterName, req: AnthropicRequest):
                           "parameters": t.input_schema}}
             for t in req.tools
         ]
-    # print(req.model_dump_json(indent=2))
     session_id, prompt, model_type, thinking, search = await _prepare_session(
         adapter_name, messages, _content_to_text(req.system), tools_raw, req.model
     )
