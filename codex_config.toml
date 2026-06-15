@@ -1,0 +1,13 @@
+# Codex client configuration for local DS/QW Proxy
+# Use this with tools that expect a `config.toml` for Codex/OpenAI CLI integration.
+
+[openai]
+api_key = "any"
+base_url = "http://localhost:8000"
+# If the server is configured to require a key, set that same key here.
+# Example:
+# api_key = "your-secret-key"
+
+[headers]
+# Some clients may support custom headers via config. If so, include:
+# x-api-key = "your-secret-key"

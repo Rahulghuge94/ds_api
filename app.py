@@ -134,16 +134,26 @@ async def _create_session(
     return await _run_sync(adapter.create_session)
 
 
+def _content_to_text(content: Any) -> str:
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return " ".join(
+            part.get("text", "")
+            for part in content
+            if isinstance(part, dict) and part.get("type") == "text"
+        )
+    return str(content)
+
+
 def _messages_to_prompt(messages: list[dict]) -> str:
     """Flatten an OpenAI-style messages list into a single prompt string."""
     parts = []
     for msg in messages:
         role    = msg.get("role", "user")
-        content = msg.get("content") or ""
-        if isinstance(content, list):
-            content = " ".join(
-                b.get("text", "") for b in content if b.get("type") == "text"
-            )
+        content = _content_to_text(msg.get("content"))
         tag = {"system": "[System]", "assistant": "[Assistant]"}.get(role, "[User]")
         parts.append(f"{tag}: {content}")
     return "\n\n".join(parts)
@@ -268,7 +278,7 @@ class AnthropicRequest(BaseModel):
     model: str = "deepseek-chat"
     max_tokens: int = 1024
     messages: list[AnthropicMessage]
-    system: Optional[str] = None
+    system: Optional[Any] = None
     tools: Optional[list[AnthropicTool]] = None
     stream: Optional[bool] = False
     temperature: Optional[float] = None
@@ -709,9 +719,9 @@ async def anthropic_messages(adapter_name: AdapterName, req: AnthropicRequest):
                           "parameters": t.input_schema}}
             for t in req.tools
         ]
-
+    # print(req.model_dump_json(indent=2))
     session_id, prompt, model_type, thinking, search = await _prepare_session(
-        adapter_name, messages, req.system, tools_raw, req.model
+        adapter_name, messages, _content_to_text(req.system), tools_raw, req.model
     )
     msg_id = _rand_id("msg")
 
