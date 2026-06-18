@@ -46,6 +46,7 @@ Create a `.env` or copy `.example.env` file in the same directory as `app.py`, o
 | `QWEN_TOKEN` | for Qwen | — | Bearer token from `chat.qwen.ai` |
 | `QWEN_COOKIES` | for Qwen | — | Session cookies from `chat.qwen.ai` |
 | `DEEPSEEK_COOKIES` | yes | — | Full cookie string from the same session |
+| `REQUEST_LOG_FILE` | no | `logs/requests.log` | Rotating asynchronous HTTP request log |
 | `API_KEY` | no | *(empty)* | If set, every request must carry `Authorization: Bearer <API_KEY>`. Leave empty to disable the guard entirely. |
 | `WASM_PATH` | no | `sha3_wasm_bg.wasm` | Path to the SHA-3 WASM binary. Only needed if you move the file. |
 
@@ -329,6 +330,9 @@ This is entirely transparent to the calling SDK — it sees the same tool-call e
 
 ## Architecture
 
+At server startup, one DeepSeek chat and one Qwen chat are created. Their IDs
+remain unchanged and are reused for every request until the server stops.
+
 ```
 Client
   │
@@ -338,7 +342,7 @@ FastAPI route handler
   │  inject DSML tool prompt into system message
   │  _prepare_session() / _run_sync()
   ▼
-DeepSeekAdapter.create_session()
+Process-lifetime adapter chat ID
 DeepSeekAdapter.chat() or .chat_stream()    ← blocking; runs in thread pool
   │
   ▼  (streaming path)

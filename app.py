@@ -22,9 +22,12 @@ Environment variables (or .env file):
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import json
+import logging
+import logging
 import os
+import queue
+import hashlib
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -65,21 +68,36 @@ from ds_api.tool_sieve import StreamSieve
 ds_adapter: DeepSeekAdapter | None = None
 qw_adapter: QwenAdapter | None = None
 AdapterName = Literal["ds", "qwen"]
+_upstream_chat_ids: dict[AdapterName, str] = {}
 
-_session_lock = asyncio.Lock()
-_session_by_key: dict[str, str] = {}
-_session_by_response_id: dict[str, str] = {}
+# Configure logger to save to a file
+logging.basicConfig(
+    filename='app.log',
+    filemode='a', # 'a' to append, 'w' to overwrite
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global ds_adapter, qw_adapter
+
     ds_adapter = DeepSeekAdapter()
     qw_adapter = QwenAdapter()
-    yield
-    if ds_adapter and ds_adapter._client:
-        ds_adapter._client.close()
-    if qw_adapter and qw_adapter._client:
-        qw_adapter._client.close()
+    try:
+        ds_chat_id, qw_chat_id = await asyncio.gather(
+            _run_sync(ds_adapter.create_session),
+            _run_sync(qw_adapter.create_session),
+        )
+        _upstream_chat_ids["ds"] = ds_chat_id
+        _upstream_chat_ids["qwen"] = qw_chat_id
+        yield
+    finally:
+        _upstream_chat_ids.clear()
+        if ds_adapter and ds_adapter._client:
+            ds_adapter._client.close()
+        if qw_adapter and qw_adapter._client:
+            qw_adapter._client.close()
     
 app = FastAPI(
     title="DS/QW Proxy",
@@ -90,6 +108,40 @@ app = FastAPI(
     version="1.0.0",
     lifespan=lifespan,
 )
+
+class AsyncRequestLogMiddleware:
+    """Log completed HTTP requests without writing files on the event loop."""
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        started = time.perf_counter()
+        status_code = 500
+        request_id = uuid.uuid4().hex[:12]
+
+        async def send_with_status(message):
+            nonlocal status_code
+            if message["type"] == "http.response.start":
+                status_code = message["status"]
+            await send(message)
+
+        try:
+            await self.app(scope, receive, send_with_status)
+        except Exception:
+            raise
+
+def _client_address(scope: dict) -> str:
+    client = scope.get("client")
+    if not client:
+        return "-"
+    return f"{client[0]}:{client[1]}"
+
+app.add_middleware(AsyncRequestLogMiddleware)
 
 _bearer = HTTPBearer(auto_error=False)
 
@@ -109,6 +161,12 @@ def _get_adapter(name: AdapterName) -> DeepSeekAdapter | QwenAdapter:
         raise HTTPException(500, "Adapter not initialised")
     return _adapter
 
+def _get_chat_id(name: AdapterName) -> str:
+    chat_id = _upstream_chat_ids.get(name)
+    if not chat_id:
+        raise HTTPException(503, f"{name} chat is not initialised")
+    return chat_id
+
 def _model_to_ds(model: str) -> tuple[str | None, bool, bool]:
     """Map model string → (model_type, thinking_enabled, search_enabled)."""
     m = model.lower()
@@ -117,7 +175,6 @@ def _model_to_ds(model: str) -> tuple[str | None, bool, bool]:
     if any(k in m for k in ("search", "online")):
         return None, False, True
     return None, False, False
-
 
 def _model_settings(
     adapter_name: AdapterName,
@@ -128,7 +185,6 @@ def _model_settings(
         model_type = model if model.lower().startswith("qwen") else None
     return model_type, thinking_enabled, search_enabled
 
-
 async def _create_session(
     adapter_name: AdapterName,
     model_type: str | None = None,
@@ -138,11 +194,9 @@ async def _create_session(
         return await _run_sync(adapter.create_session, model_type)
     return await _run_sync(adapter.create_session)
 
-
 def _stable_hash(value: Any) -> str:
     raw = json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:32]
-
 
 def _conversation_key(
     adapter_name: AdapterName,
@@ -162,13 +216,11 @@ def _conversation_key(
         'first_user': first_user_text,
     })}"
 
-
 def _first_user_text(messages: list[dict]) -> str:
     for msg in messages:
         if msg.get("role") == "user":
             return _content_to_text(msg.get("content"))
     return _content_to_text(messages[0].get("content")) if messages else ""
-
 
 def _tail_since_last_assistant(messages: list[dict]) -> list[dict]:
     """When an upstream session already has history, forward only new turns."""
@@ -177,44 +229,6 @@ def _tail_since_last_assistant(messages: list[dict]) -> list[dict]:
             tail = messages[idx + 1:]
             return tail or messages[-1:]
     return messages
-
-
-async def _resolve_session(
-    adapter_name: AdapterName,
-    model_type: str | None,
-    session_key: str | None = None,
-    previous_response_id: str | None = None,
-) -> tuple[str, bool]:
-    async with _session_lock:
-        if previous_response_id:
-            session_id = _session_by_response_id.get(previous_response_id)
-            if session_id:
-                return session_id, False
-        if session_key:
-            session_id = _session_by_key.get(session_key)
-            if session_id:
-                return session_id, False
-
-    session_id = await _create_session(adapter_name, model_type)
-
-    async with _session_lock:
-        if session_key:
-            existing = _session_by_key.setdefault(session_key, session_id)
-            if existing != session_id:
-                return existing, False
-    return session_id, True
-
-
-async def _remember_response_session(
-    response_id: str,
-    session_id: str,
-    session_key: str | None = None,
-) -> None:
-    async with _session_lock:
-        _session_by_response_id[response_id] = session_id
-        if session_key:
-            _session_by_key[session_key] = session_id
-
 
 def _content_to_text(content: Any) -> str:
     if content is None:
@@ -228,7 +242,6 @@ def _content_to_text(content: Any) -> str:
             if isinstance(part, dict) and part.get("type") == "text"
         )
     return str(content)
-
 
 def _messages_to_prompt(messages: list[dict]) -> str:
     """Flatten an OpenAI-style messages list into a single prompt string."""
@@ -290,37 +303,25 @@ async def _prepare_session(
     system: str | None,
     tools: list[dict] | None,
     model: str,
-    surface: str,
-    session_hint: str | None = None,
-    previous_response_id: str | None = None,
-) -> tuple[str, str, str | None, bool, bool, str | None]:
+) -> tuple[str, str, str | None, bool, bool]:
     """
-    Build prompt + resolve DS/QW session.
-    Returns (session_id, prompt, model_type, thinking_enabled, search_enabled, session_key).
+    Build a prompt and select the process-lifetime chat for this adapter.
     """
     model_type, thinking_enabled, search_enabled = _model_settings(
         adapter_name, model
     )
     sys_prompt = _inject_tools(system, tools)
-    session_key = _conversation_key(
-        adapter_name, surface, model, _first_user_text(messages), sys_prompt, session_hint
-    )
-    session_id, is_new_session = await _resolve_session(
-        adapter_name, model_type, session_key, previous_response_id
-    )
-    prompt_messages = list(messages) if is_new_session else _tail_since_last_assistant(messages)
-    if sys_prompt and is_new_session:
+    prompt_messages = _tail_since_last_assistant(messages)
+    if sys_prompt:
         prompt_messages = [{"role": "system", "content": sys_prompt}] + prompt_messages
     prompt = _messages_to_prompt(prompt_messages)
-    return session_id, prompt, model_type, thinking_enabled, search_enabled, session_key
-
-
-def _request_session_hint(req: BaseModel) -> str | None:
-    for name in ("session_id", "chat_id", "conversation_id"):
-        value = getattr(req, name, None)
-        if value:
-            return str(value)
-    return None
+    return (
+        _get_chat_id(adapter_name),
+        prompt,
+        model_type,
+        thinking_enabled,
+        search_enabled,
+    )
 
 def _rand_id(prefix: str = "chatcmpl") -> str:
     return f"{prefix}-{uuid.uuid4().hex[:24]}"
@@ -335,11 +336,9 @@ class OAIFunction(BaseModel):
     description: Optional[str] = None
     parameters: Optional[dict] = None
 
-
 class OAITool(BaseModel):
     type: str = "function"
     function: OAIFunction
-
 
 class OAIMessage(BaseModel):
     role: str
@@ -347,7 +346,6 @@ class OAIMessage(BaseModel):
     name: Optional[str] = None
     tool_call_id: Optional[str] = None
     tool_calls: Optional[list[dict]] = None
-
 
 class OAIChatRequest(BaseModel):
     model: str = "deepseek-chat"
@@ -362,19 +360,15 @@ class OAIChatRequest(BaseModel):
     chat_id: Optional[str] = None
     conversation_id: Optional[str] = None
 
-
 # ─ Anthropic ─────────────────────────────────────────────────────────────────
-
 class AnthropicMessage(BaseModel):
     role: str
     content: Any  # str | list[{"type": "text", "text": "..."}]
-
 
 class AnthropicTool(BaseModel):
     name: str
     description: Optional[str] = None
     input_schema: Optional[dict] = None
-
 
 class AnthropicRequest(BaseModel):
     model: str = "deepseek-chat"
@@ -388,9 +382,7 @@ class AnthropicRequest(BaseModel):
     chat_id: Optional[str] = None
     conversation_id: Optional[str] = None
 
-
 # ─ Codex / legacy ────────────────────────────────────────────────────────────
-
 class CodexRequest(BaseModel):
     model: str = "code-davinci-002"
     prompt: Any = ""       # str | list[str]
@@ -405,20 +397,16 @@ class CodexRequest(BaseModel):
     conversation_id: Optional[str] = None
 
 
-# ─ Responses API (OpenAI Responses / Codex CLI) ──────────────────────────────
-
 class ResponsesInputItem(BaseModel):
     """One turn in the `input` array — mirrors the Responses API message format."""
     role: str                       # "user" | "assistant" | "system" | "developer"
     content: Any                    # str | list[{"type":"input_text","text":"..."}]
-
 
 class ResponsesTool(BaseModel):
     type: str                       # "function" | "web_search" | "file_search" | "computer_use_preview"
     name: Optional[str] = None
     description: Optional[str] = None
     parameters: Optional[dict] = None
-
 
 class ResponsesRequest(BaseModel):
     model: str = "deepseek-chat"
@@ -434,11 +422,6 @@ class ResponsesRequest(BaseModel):
     session_id: Optional[str] = None
     chat_id: Optional[str] = None
     conversation_id: Optional[str] = None
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# Streaming generators
-# ══════════════════════════════════════════════════════════════════════════════
 
 async def _token_queue(
     adapter: DeepSeekAdapter | QwenAdapter,
@@ -468,7 +451,6 @@ async def _token_queue(
 
     loop.run_in_executor(None, _produce)
     return q
-
 
 async def _oai_stream_gen(
     adapter_name: AdapterName,
@@ -523,7 +505,6 @@ async def _oai_stream_gen(
                 "created": created, "model": model,
                 "choices": [{"index": 0, "delta": {}, "finish_reason": finish}]})
     yield _SSE_DONE
-
 
 async def _anthropic_stream_gen(
     adapter_name: AdapterName,
@@ -593,7 +574,6 @@ async def _anthropic_stream_gen(
     yield _sse({"type": "message_stop"})
     yield _SSE_DONE
 
-
 async def _codex_stream_gen(
     adapter_name: AdapterName,
     session_id: str, prompt: str, model: str,
@@ -619,7 +599,6 @@ async def _codex_stream_gen(
                 "created": created, "model": model,
                 "choices": [{"text": "", "index": 0, "logprobs": None, "finish_reason": "stop"}]})
     yield _SSE_DONE
-
 
 async def _responses_stream_gen(
     adapter_name: AdapterName,
@@ -767,13 +746,11 @@ async def _responses_stream_gen(
     })
     yield _SSE_DONE
 
-
-
-
 @app.post("/{adapter_name}/v1/chat/completions", dependencies=[Depends(_check_auth)])
 async def oai_chat_completions(adapter_name: AdapterName, req: OAIChatRequest):
     """OpenAI Chat Completions — streaming and non-streaming with tool calls."""
     messages = [m.model_dump(exclude_none=True) for m in req.messages]
+    logging.info(messages) # log requests
     tools_raw = (
         [{"function": t.function.model_dump()} for t in req.tools] if req.tools else None
     )
@@ -782,12 +759,10 @@ async def oai_chat_completions(adapter_name: AdapterName, req: OAIChatRequest):
     )
     non_sys = [m for m in messages if m["role"] != "system"]
 
-    session_id, prompt, model_type, thinking, search, session_key = await _prepare_session(
-        adapter_name, non_sys, system, tools_raw, req.model, "chat",
-        session_hint=_request_session_hint(req),
+    session_id, prompt, model_type, thinking, search = await _prepare_session(
+        adapter_name, non_sys, system, tools_raw, req.model,
     )
     chat_id = _rand_id("chatcmpl")
-    await _remember_response_session(chat_id, session_id, session_key)
 
     if req.stream:
         return StreamingResponse(
@@ -816,15 +791,11 @@ async def oai_chat_completions(adapter_name: AdapterName, req: OAIChatRequest):
         "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
     })
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-# Routes — Anthropic
-# ══════════════════════════════════════════════════════════════════════════════
-
 @app.post("/{adapter_name}/v1/messages", dependencies=[Depends(_check_auth)])
 async def anthropic_messages(adapter_name: AdapterName, req: AnthropicRequest):
     """Anthropic Messages API — streaming and non-streaming with tool_use blocks."""
     messages = [m.model_dump() for m in req.messages]
+    logging.info(messages) # log requests
     tools_raw: list[dict] | None = None
     if req.tools:
         tools_raw = [
@@ -832,12 +803,10 @@ async def anthropic_messages(adapter_name: AdapterName, req: AnthropicRequest):
                           "parameters": t.input_schema}}
             for t in req.tools
         ]
-    session_id, prompt, model_type, thinking, search, session_key = await _prepare_session(
+    session_id, prompt, model_type, thinking, search = await _prepare_session(
         adapter_name, messages, _content_to_text(req.system), tools_raw, req.model,
-        "anthropic", session_hint=_request_session_hint(req),
     )
     msg_id = _rand_id("msg")
-    await _remember_response_session(msg_id, session_id, session_key)
 
     if req.stream:
         return StreamingResponse(
@@ -873,11 +842,6 @@ async def anthropic_messages(adapter_name: AdapterName, req: AnthropicRequest):
         "usage": {"input_tokens": 0, "output_tokens": 0},
     })
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-# Routes — Codex / legacy completions
-# ══════════════════════════════════════════════════════════════════════════════
-
 async def _codex_handler(
     adapter_name: AdapterName,
     req: CodexRequest,
@@ -888,13 +852,9 @@ async def _codex_handler(
     model_type, thinking, search = _model_settings(adapter_name, model)
 
     prompt_text = "\n".join(req.prompt) if isinstance(req.prompt, list) else str(req.prompt)
-    session_key = _conversation_key(
-        adapter_name, "completions", model, prompt_text, explicit_id=_request_session_hint(req)
-    )
-    session_id, _ = await _resolve_session(adapter_name, model_type, session_key)
+    session_id = _get_chat_id(adapter_name)
     cmpl_id     = _rand_id("cmpl")
     created     = int(time.time())
-    await _remember_response_session(cmpl_id, session_id, session_key)
 
     if req.stream:
         return StreamingResponse(
@@ -918,12 +878,10 @@ async def _codex_handler(
         "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
     })
 
-
 @app.post("/{adapter_name}/v1/completions", dependencies=[Depends(_check_auth)])
 async def completions(adapter_name: AdapterName, req: CodexRequest):
     """Legacy /v1/completions endpoint (OpenAI text completion format)."""
     return await _codex_handler(adapter_name, req)
-
 
 @app.post("/{adapter_name}/v1/engines/{engine}/completions", dependencies=[Depends(_check_auth)])
 async def codex_completions(adapter_name: AdapterName, engine: str, req: CodexRequest):
@@ -952,7 +910,7 @@ async def responses(adapter_name: AdapterName, req: ResponsesRequest):
       • streaming (response.* SSE events) and non-streaming
     """
     messages = _responses_input_to_messages(req.input)
-
+    logging.info(messages) # log requests
     # Build tools_raw from Responses-API tool format
     tools_raw: list[dict] | None = None
     if req.tools:
@@ -976,21 +934,14 @@ async def responses(adapter_name: AdapterName, req: ResponsesRequest):
             model_type = model_type_override or model_type
 
     sys_prompt = _inject_tools(req.instructions, tools_raw)
-    session_key = _conversation_key(
-        adapter_name, "responses", req.model, _first_user_text(messages), sys_prompt,
-        explicit_id=_request_session_hint(req),
-    )
-    session_id, is_new_session = await _resolve_session(
-        adapter_name, model_type, session_key, req.previous_response_id
-    )
-    prompt_messages = list(messages) if is_new_session else _tail_since_last_assistant(messages)
-    if sys_prompt and is_new_session:
+    session_id = _get_chat_id(adapter_name)
+    prompt_messages = _tail_since_last_assistant(messages)
+    if sys_prompt:
         prompt_messages = [{"role": "system", "content": sys_prompt}] + prompt_messages
 
     prompt     = _messages_to_prompt(prompt_messages)
     resp_id    = _rand_id("resp")
     created    = int(time.time())
-    await _remember_response_session(resp_id, session_id, session_key)
 
     if req.stream:
         return StreamingResponse(
@@ -1036,9 +987,6 @@ async def responses(adapter_name: AdapterName, req: ResponsesRequest):
         "usage": {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
     })
 
-
-
-
 _DS_MODELS = [
     {"id": "deepseek-chat",     "object": "model", "created": 0, "owned_by": "deepseek"},
     {"id": "deepseek-reasoner", "object": "model", "created": 0, "owned_by": "deepseek"},
@@ -1061,11 +1009,9 @@ _QWEN_MODELS = [
 def _models_for(adapter_name: AdapterName) -> list[dict]:
     return _QWEN_MODELS if adapter_name == "qwen" else _DS_MODELS
 
-
 @app.get("/{adapter_name}/v1/models", dependencies=[Depends(_check_auth)])
 async def list_models(adapter_name: AdapterName):
     return JSONResponse({"object": "list", "data": _models_for(adapter_name)})
-
 
 @app.get("/{adapter_name}/v1/models/{model_id}", dependencies=[Depends(_check_auth)])
 async def get_model(adapter_name: AdapterName, model_id: str):
@@ -1074,7 +1020,6 @@ async def get_model(adapter_name: AdapterName, model_id: str):
             return JSONResponse(m)
     raise HTTPException(404, f"Model '{model_id}' not found")
 
-
 @app.get("/{adapter_name}/health")
 async def health(adapter_name: AdapterName):
     return {
@@ -1082,7 +1027,6 @@ async def health(adapter_name: AdapterName):
         "adapter": adapter_name,
         "adapter_ready": _get_adapter(adapter_name) is not None,
     }
-
 
 if __name__ == "__main__":
     import uvicorn
