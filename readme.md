@@ -1,374 +1,438 @@
-# DeepSeek Proxy
+# DS API Proxy
 
-A FastAPI server that exposes DeepSeek and Qwen Chat behind three drop-in API surfaces — OpenAI, Anthropic, and the OpenAI Responses API (used by Codex CLI) — with full DSML tool-call support and streaming on every route.
+DS API Proxy is a FastAPI service that exposes OpenAI-, Anthropic-, and
+Codex-compatible endpoints over authenticated DeepSeek, Qwen, and ChatGPT web
+sessions.
 
-## Adapter URLs
+It provides a common local API for chat, streaming, legacy text completions,
+and function calling. Function definitions are translated through DSML
+(DeepSeek Markup Language), allowing clients to receive familiar OpenAI or
+Anthropic tool-call responses.
 
-The first URL segment selects the upstream adapter:
+> [!IMPORTANT]
+> This project uses internal, undocumented web endpoints and browser-session
+> credentials. It is not an official SDK for DeepSeek, Qwen, OpenAI, or
+> Anthropic. Upstream changes may break compatibility without notice. Use only
+> accounts and credentials you are authorized to access.
 
-- DeepSeek base URL: `http://{host}:{port}/ds`
-- Qwen base URL: `http://{host}:{port}/qwen`
+## Features
 
-For example, OpenAI chat completions are available at:
+- DeepSeek, Qwen, and ChatGPT upstream adapters
+- OpenAI Chat Completions-compatible endpoint
+- Anthropic Messages-compatible endpoint
+- OpenAI Responses-compatible endpoint for agent and Codex-style clients
+- Legacy OpenAI text completion endpoints
+- Server-Sent Events (SSE) streaming
+- Function-tool translation through DSML
+- DeepSeek reasoning and web-search routing by model name
+- Optional bearer-token protection
+- FastAPI OpenAPI documentation
 
-- `POST http://localhost:8000/ds/v1/chat/completions`
-- `POST http://localhost:8000/qwen/v1/chat/completions`
+## Architecture
 
-The adapter URL decides which service receives the request. The request's
-`model` field controls model features within that adapter.
-
----
-
-## File layout
-
+```text
+Client
+  |
+  | OpenAI / Anthropic / Responses request
+  v
+FastAPI route
+  |
+  | Normalize messages and inject DSML tool instructions
+  v
+Selected adapter: /ds, /qwen, or /chatgpt
+  |
+  | Authenticated request to the provider's web backend
+  v
+Upstream token stream
+  |
+  | StreamSieve separates text from DSML tool calls
+  v
+Translated JSON response or SSE stream
 ```
+
+Blocking upstream HTTP work runs in an executor so long-running requests do
+not directly block FastAPI's event loop.
+
+## Repository Layout
+
+```text
 .
-├── app.py              # FastAPI application (this repo)
-├── ds_api
-├────── adaptor.py             # DeepSeekAdapter — session management, HTTP bridge
-├────── tool_dsml.py           # DSML format parser / formatter / prompt builder
-├────── tool_sieve.py          # StreamSieve — real-time DSML extraction from token stream
-├────── sha3_wasm_bg.wasm      # SHA-3 WASM used by the adaptor for request signing
-├────── __init__.py
-├── .env                       # environment variables (see below)
-└── .requirements.txt          # package list
+|-- app.py                     FastAPI application and protocol translation
+|-- ds_api/
+|   |-- adaptor.py             DeepSeek, Qwen, and ChatGPT adapters
+|   |-- tool_dsml.py           DSML prompt builder, parser, and formatter
+|   |-- tool_sieve.py          Incremental DSML extraction for streams
+|   |-- sha3_wasm_bg.wasm      DeepSeek proof-of-work helper
+|   `-- __init__.py
+|-- requirements.txt           Python dependencies
+|-- .example.env               Environment-variable template
+|-- codex_config.toml          Example Codex provider configuration
+|-- setting.json               Example Anthropic-compatible client settings
+|-- run.bat.example            Windows launch template
+|-- run.sh.example             Shell launch template
+|-- example.py                 Direct Qwen HTTP experiment
+`-- example2.py                Direct QwenAdapter experiment
 ```
 
----
+## Requirements
 
-## Environment variables
-
-Create a `.env` or copy `.example.env` file in the same directory as `app.py`, or export them in your shell.
-
-| Variable | Required | Default | Description |
-|---|---|---|---|
-| `DEEPSEEK_TOKEN` | yes | — | Bearer token from `chat.deepseek.com` (grab from browser DevTools → Network → Authorization header) |
-| `QWEN_TOKEN` | for Qwen | — | Bearer token from `chat.qwen.ai` |
-| `QWEN_COOKIES` | for Qwen | — | Session cookies from `chat.qwen.ai` |
-| `DEEPSEEK_COOKIES` | yes | — | Full cookie string from the same session |
-| `REQUEST_LOG_FILE` | no | `logs/requests.log` | Rotating asynchronous HTTP request log |
-| `API_KEY` | no | *(empty)* | If set, every request must carry `Authorization: Bearer <API_KEY>`. Leave empty to disable the guard entirely. |
-| `WASM_PATH` | no | `sha3_wasm_bg.wasm` | Path to the SHA-3 WASM binary. Only needed if you move the file. |
-
----
+- Python 3.10 or newer
+- An authenticated browser session for at least one supported upstream
+- The bundled `ds_api/sha3_wasm_bg.wasm` file
 
 ## Installation
 
-```bash
-pip install fastapi uvicorn httpx python-dotenv wasmtime
-```
-or 
+### Windows PowerShell
 
-```bash
+```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install --upgrade pip
 pip install -r requirements.txt
+Copy-Item .example.env .env
 ```
-Python 3.11+ is recommended (uses `X | Y` union syntax and `list[T]` generics throughout).
 
----
-
-## Running
+### macOS or Linux
 
 ```bash
-# development
-uvicorn app:app --host 0.0.0.0 --port 8000 --reload
-
-# production
-python app.py
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+pip install -r requirements.txt
+cp .example.env .env
 ```
 
-Interactive docs are available at `http://localhost:8000/docs` once the server is running.
+Edit `.env` and configure only the adapters you intend to use.
 
----
+## Configuration
 
-## API surfaces
+| Variable | Required | Description |
+|---|---:|---|
+| `DEEPSEEK_COOKIES` | For DeepSeek | Cookie header from an authenticated `chat.deepseek.com` session |
+| `DEEPSEEK_TOKEN` | For DeepSeek | Bearer token used by the DeepSeek web application |
+| `QWEN_COOKIES` | For Qwen | Cookies from an authenticated `chat.qwen.ai` session |
+| `QWEN_TOKEN` | Usually for Qwen | Bearer token used by the Qwen web application |
+| `CHATGPT_COOKIES` | For ChatGPT | Cookie header from an authenticated `chatgpt.com` session |
+| `CHATGPT_COOKIE_PART_1` | Optional | First half of a split ChatGPT cookie value |
+| `CHATGPT_COOKIE_PART_2` | Optional | Second half of a split ChatGPT cookie value |
+| `CHATGPT_TOKEN` | Optional | ChatGPT bearer token; otherwise one is obtained from session cookies |
+| `API_KEY` | Optional | Bearer token required from proxy clients; empty disables authentication |
+| `WASM_PATH` | Optional | DeepSeek WASM path; defaults to `ds_api/sha3_wasm_bg.wasm` |
 
-### OpenAI — Chat Completions
+An adapter is initialized only when its cookie variable is present. ChatGPT
+accepts either `CHATGPT_COOKIES` or the concatenated values of
+`CHATGPT_COOKIE_PART_1` and `CHATGPT_COOKIE_PART_2`.
 
-`POST /{adapter}/v1/chat/completions`
+The application reads `API_KEY` (singular). When configured, protected
+endpoints require:
 
-Drop-in replacement for the OpenAI Chat Completions endpoint. Accepts the full OpenAI request shape and returns identical response envelopes.
+```http
+Authorization: Bearer <API_KEY>
+```
+
+Do not commit `.env`, browser cookies, access tokens, or copied authorization
+headers. The included `.gitignore` excludes `.env`.
+
+## Running the Server
+
+For local development:
+
+```bash
+uvicorn app:app --host 127.0.0.1 --port 8000 --reload
+```
+
+To listen on all network interfaces:
+
+```bash
+uvicorn app:app --host 0.0.0.0 --port 8000
+```
+
+You can also run `python app.py`. The direct Python entry point listens on
+`0.0.0.0:8000`.
+
+Once running:
+
+- Swagger UI: `http://localhost:8000/docs`
+- OpenAPI schema: `http://localhost:8000/openapi.json`
+- DeepSeek health: `http://localhost:8000/ds/health`
+- Qwen health: `http://localhost:8000/qwen/health`
+- ChatGPT health: `http://localhost:8000/chatgpt/health`
+
+A health response reports `adapter_ready: true` only when the adapter was
+configured and its startup session was created successfully.
+
+## Adapter Base URLs
+
+| Adapter | Base URL |
+|---|---|
+| DeepSeek | `http://localhost:8000/ds/v1` |
+| Qwen | `http://localhost:8000/qwen/v1` |
+| ChatGPT | `http://localhost:8000/chatgpt/v1` |
+
+## API Endpoints
+
+| Method | Path | Purpose |
+|---|---|---|
+| `POST` | `/{adapter}/v1/chat/completions` | OpenAI-style chat completions |
+| `POST` | `/{adapter}/v1/messages` | Anthropic-style messages |
+| `POST` | `/{adapter}/v1/responses` | OpenAI Responses-style requests |
+| `POST` | `/{adapter}/v1/completions` | Legacy text completions |
+| `POST` | `/{adapter}/v1/engines/{engine}/completions` | Classic engine-based completions |
+| `GET` | `/{adapter}/v1/models` | List advertised model identifiers |
+| `GET` | `/{adapter}/v1/models/{model_id}` | Retrieve an advertised model |
+| `GET` | `/{adapter}/health` | Check adapter readiness |
+
+Replace `{adapter}` with `ds`, `qwen`, or `chatgpt`.
+
+## Quick Start
+
+### OpenAI Chat Completions
 
 ```bash
 curl http://localhost:8000/ds/v1/chat/completions \
   -H "Content-Type: application/json" \
+  -H "Authorization: Bearer your-proxy-key" \
   -d '{
     "model": "deepseek-chat",
-    "messages": [{"role": "user", "content": "Hello"}],
-    "stream": false
+    "messages": [
+      {"role": "user", "content": "Explain dependency injection briefly."}
+    ]
   }'
 ```
 
-With tool calls:
+Set `"stream": true` to receive `chat.completion.chunk` SSE events.
+
+### Anthropic Messages
 
 ```bash
-curl http://localhost:8000/ds/v1/chat/completions \
+curl http://localhost:8000/qwen/v1/messages \
   -H "Content-Type: application/json" \
+  -H "Authorization: Bearer your-proxy-key" \
   -d '{
-    "model": "deepseek-chat",
-    "messages": [{"role": "user", "content": "What is the weather in Mumbai?"}],
-    "tools": [{
+    "model": "qwen3.7-plus",
+    "max_tokens": 1024,
+    "system": "You are a concise technical assistant.",
+    "messages": [
+      {"role": "user", "content": "What is an event loop?"}
+    ]
+  }'
+```
+
+Set `"stream": true` to receive Anthropic-style message and content-block
+events.
+
+### OpenAI Responses
+
+```bash
+curl http://localhost:8000/chatgpt/v1/responses \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer your-proxy-key" \
+  -d '{
+    "model": "auto",
+    "instructions": "You are a senior Python engineer.",
+    "input": "Write a small retry decorator."
+  }'
+```
+
+The Responses route accepts a string or a message array in `input`. With
+`"stream": true`, it emits `response.*` SSE events and concludes with
+`data: [DONE]`.
+
+If `API_KEY` is not configured, omit the `Authorization` header.
+
+## Function Tools
+
+OpenAI-style function tools can be sent to the Chat Completions endpoint:
+
+```json
+{
+  "model": "deepseek-chat",
+  "messages": [
+    {"role": "user", "content": "What is the weather in Mumbai?"}
+  ],
+  "tools": [
+    {
       "type": "function",
       "function": {
         "name": "get_weather",
-        "description": "Get current weather for a city",
+        "description": "Get the current weather for a city",
         "parameters": {
           "type": "object",
-          "properties": {"city": {"type": "string"}},
+          "properties": {
+            "city": {"type": "string"}
+          },
           "required": ["city"]
         }
       }
-    }]
-  }'
+    }
+  ]
+}
 ```
 
-**Streaming** — set `"stream": true`. Response is standard SSE with `chat.completion.chunk` deltas, including a `tool_calls` delta chunk when tool calls are present.
+The proxy converts tool definitions into a DSML instruction, detects DSML
+tool-call markup in the response, and returns OpenAI `tool_calls`, Anthropic
+`tool_use`, or Responses `function_call` items.
 
-**Thinking / reasoning models** — use a model name containing `r1`, `reasoner`, or `think` (e.g. `"model": "deepseek-r1"`) to route to DeepSeek's expert/chain-of-thought mode.
+Tool execution remains the client's responsibility. Only function tools are
+translated by the Responses endpoint; other tool types are currently accepted
+as no-op compatibility shims.
 
-**Web search** — use a model name containing `search` or `online` (e.g. `"model": "deepseek-search"`) to enable DeepSeek's built-in web search.
+## Model Routing
 
----
+For DeepSeek, model-name keywords control upstream features:
 
-### Anthropic — Messages API
+| Model name contains | Behavior |
+|---|---|
+| `reasoner`, `r1`, or `think` | Enables expert/reasoning mode |
+| `search` or `online` | Enables upstream web search |
+| Any other value | Standard chat mode |
 
-`POST /{adapter}/v1/messages`
+On the Responses endpoint, `reasoning.effort` values of `medium` or `high`
+also enable DeepSeek expert mode. Streaming reasoning fragments are emitted as
+`response.reasoning_summary_text.delta` events.
 
-Drop-in replacement for the Anthropic Messages endpoint. Accepts Anthropic's request shape and returns `message` objects with `text` and `tool_use` content blocks.
+For Qwen, a model name beginning with `qwen` is forwarded upstream. For
+ChatGPT, the supplied model string is forwarded directly. Advertised model
+lists are static compatibility entries defined in `app.py`; they are not
+dynamically discovered.
 
-```bash
-curl http://localhost:8000/ds/v1/messages \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "deepseek-chat",
-    "max_tokens": 1024,
-    "system": "You are a helpful assistant.",
-    "messages": [{"role": "user", "content": "Explain async/await in Python."}]
-  }'
+## Client Examples
+
+### OpenAI Python SDK
+
+```python
+from openai import OpenAI
+
+client = OpenAI(
+    api_key="your-proxy-key",
+    base_url="http://localhost:8000/ds/v1",
+)
+
+response = client.chat.completions.create(
+    model="deepseek-chat",
+    messages=[{"role": "user", "content": "Hello"}],
+)
+
+print(response.choices[0].message.content)
 ```
 
-With tools:
-
-```bash
-curl http://localhost:8000/ds/v1/messages \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "deepseek-chat",
-    "max_tokens": 1024,
-    "messages": [{"role": "user", "content": "Search for the latest Nifty price."}],
-    "tools": [{
-      "name": "web_search",
-      "description": "Search the web",
-      "input_schema": {
-        "type": "object",
-        "properties": {"query": {"type": "string"}},
-        "required": ["query"]
-      }
-    }]
-  }'
-```
-
-**Streaming** — set `"stream": true`. Events follow the Anthropic SSE format: `message_start`, `content_block_start`, `content_block_delta` (text or `input_json_delta`), `content_block_stop`, `message_delta`, `message_stop`.
-
-**Using with the Anthropic Python SDK:**
+### Anthropic Python SDK
 
 ```python
 import anthropic
 
 client = anthropic.Anthropic(
-    api_key="any",                         # only checked if API_KEY is set server-side
-    base_url="http://localhost:8000",
+    api_key="your-proxy-key",
+    base_url="http://localhost:8000/qwen",
 )
 
 response = client.messages.create(
-    model="deepseek-chat",
+    model="qwen3.7-plus",
     max_tokens=1024,
     messages=[{"role": "user", "content": "Hello"}],
 )
+
 print(response.content[0].text)
 ```
 
----
+Install `openai` or `anthropic` separately when using these examples; they are
+not server dependencies.
 
-### OpenAI Responses API
+### Codex Configuration
 
-`POST /{adapter}/v1/responses`
+The included `codex_config.toml` demonstrates a custom provider:
 
-The stateful Responses API introduced in the `openai` Python SDK v2 and used by **Codex CLI** (`openai` CLI tool). This is the primary surface for agentic tool-use loops.
+```toml
+model = "qwen3.7-plus"
+model_provider = "qwen"
+
+[model_providers.qwen]
+name = "Qwen Custom Endpoint"
+base_url = "http://localhost:8000/qwen/v1"
+```
+
+If proxy authentication is enabled, configure the client to send
+`Authorization: Bearer <API_KEY>` using its supported environment-key or
+custom-header setting.
+
+## Current Compatibility Notes
+
+This service implements the fields needed by its routes, but it is not a
+complete implementation of every upstream public API.
+
+- Token usage values are currently reported as zero.
+- Sampling and token-limit fields are accepted by several request models but
+  are not forwarded consistently to the web backends.
+- `previous_response_id`, `session_id`, `chat_id`, and `conversation_id` are
+  accepted for compatibility but do not select independent proxy sessions.
+- One upstream chat/session is created per adapter at startup and reused for
+  requests during that process.
+- Message history after the latest assistant message is used to construct the
+  next upstream prompt.
+- Static model entries do not guarantee that the account can access a model.
+- Internal provider APIs and anti-bot challenges may change at any time.
+
+Because the current upstream session is shared, use this proxy as a
+single-user/local-development service unless you add per-client isolation.
+
+## Logging and Security
+
+Request message content is written to `app.log`. This can include prompts,
+tool results, source code, or other sensitive material. Protect, rotate, or
+disable this log before using the service with confidential data.
+
+For safer operation:
+
+- Bind to `127.0.0.1` unless remote access is required.
+- Set a strong `API_KEY` before exposing the server to a network.
+- Put TLS and access controls in front of the service for remote use.
+- Treat `.env`, cookies, bearer tokens, and `app.log` as secrets.
+- Restart the server after rotating upstream credentials.
+
+The health endpoints are not protected by `API_KEY`.
+
+## Troubleshooting
+
+### Adapter reports `unavailable`
+
+Check that the adapter's cookie variable is present, restart the server, and
+review startup errors. A configured adapter is marked unavailable when its
+initial session cannot be created.
+
+### `401 Invalid or missing API key`
+
+Send `Authorization: Bearer <value>` using the exact value configured in
+`API_KEY`, or leave `API_KEY` empty for local unauthenticated use.
+
+### DeepSeek WASM file error
+
+Run the application from the repository root and confirm that
+`ds_api/sha3_wasm_bg.wasm` exists. If it is elsewhere, set `WASM_PATH`.
+
+### Upstream authentication failure
+
+Browser-session credentials expire. Sign in again, refresh the relevant
+cookies or token in `.env`, and restart the proxy.
+
+### Provider behavior changed
+
+Failures after a provider website update may require changes in
+`ds_api/adaptor.py`. Undocumented endpoints cannot offer the stability of
+official APIs.
+
+## Development
+
+Basic syntax validation:
 
 ```bash
-curl http://localhost:8000/ds/v1/responses \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "deepseek-chat",
-    "input": "Refactor this function to use list comprehension.",
-    "instructions": "You are a senior Python engineer."
-  }'
+python -m py_compile app.py ds_api/adaptor.py ds_api/tool_dsml.py ds_api/tool_sieve.py
 ```
 
-Multi-turn input array (SDK v2 format):
+There is currently no automated test suite. When changing an adapter or
+response translator, validate both streaming and non-streaming requests
+against each configured provider.
 
-```bash
-curl http://localhost:8000/ds/v1/responses \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "deepseek-chat",
-    "input": [
-      {"role": "user", "content": "What does os.walk do?"},
-      {"role": "assistant", "content": "It recursively yields directory trees..."},
-      {"role": "user", "content": "Show me an example."}
-    ]
-  }'
-```
+## License
 
-With `reasoning.effort` (forces thinking mode regardless of model name):
-
-```bash
-curl http://localhost:8000/ds/v1/responses \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "deepseek-chat",
-    "input": "Prove that sqrt(2) is irrational.",
-    "reasoning": {"effort": "high"}
-  }'
-```
-
-**Streaming** — set `"stream": true`. Events follow the Responses API SSE format: `response.created`, `response.in_progress`, `response.output_item.added`, `response.content_part.added`, `response.output_text.delta` (one per token), `response.output_text.done`, `response.content_part.done`, `response.output_item.done`, `response.completed`.
-
-Thinking tokens from DeepSeek expert mode are surfaced as `response.reasoning_summary_text.delta` events so Codex CLI can render them as a collapsible reasoning block.
-
-**Using with Codex CLI:**
-
-```bash
-OPENAI_API_KEY=any \
-OPENAI_BASE_URL=http://localhost:8000/ds/v1 \
-codex "Explain this codebase"
-```
-
-**Using with the openai Python SDK v2:**
-
-```python
-from openai import OpenAI
-
-client = OpenAI(api_key="any", base_url="http://localhost:8000/ds/v1")
-
-response = client.responses.create(
-    model="deepseek-chat",
-    input="Write a binary search in Python.",
-)
-print(response.output[0].content[0].text)
-```
-
----
-
-### Legacy Codex completions
-
-`POST /{adapter}/v1/completions`
-`POST /{adapter}/v1/engines/{engine}/completions`
-
-For tooling that still uses the pre-chat completions format (older versions of GitHub Copilot plugins, direct Codex API integrations).
-
-```bash
-curl http://localhost:8000/ds/v1/completions \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "code-davinci-002",
-    "prompt": "def fibonacci(n):",
-    "max_tokens": 200,
-    "stream": false
-  }'
-```
-
-The classic engine path:
-
-```bash
-curl http://localhost:8000/ds/v1/engines/code-davinci-002/completions \
-  -H "Content-Type: application/json" \
-  -d '{"prompt": "# Sort a list\n", "max_tokens": 100}'
-```
-
-Supports `echo` (prepend prompt to output) and `suffix` (append to output), matching the original Codex API behaviour.
-
----
-
-### Utility endpoints
-
-| Method | Path | Description |
-|---|---|---|
-| `GET` | `/{adapter}/v1/models` | List model IDs for the selected adapter |
-| `GET` | `/{adapter}/v1/models/{id}` | Get a model record for the selected adapter |
-| `GET` | `/{adapter}/health` | Liveness check for the selected adapter |
-
----
-
-## Model routing
-
-The server maps model name keywords to DeepSeek backend modes automatically. You never need to change the server config — just change the model string in your request.
-
-| Model name contains | DeepSeek mode |
-|---|---|
-| `r1`, `reasoner`, `think` | Expert / chain-of-thought (`thinking_enabled=True`) |
-| `search`, `online` | Web search enabled |
-| anything else | Standard chat |
-
-`reasoning.effort` in a Responses API request (`"medium"` or `"high"`) also forces thinking mode, independently of the model name.
-
----
-
-## Tool calls (DSML)
-
-DeepSeek does not natively support the OpenAI function-calling wire protocol. This proxy bridges the gap using DSML (DeepSeek Markup Language):
-
-1. `build_dsml_tool_prompt()` appends a structured XML calling convention to the system message before the request is sent.
-2. DeepSeek responds with `<|DSML|tool_calls>` XML when it wants to call a tool.
-3. `StreamSieve` intercepts these tags in real time as tokens arrive, splitting them from plain text.
-4. `parse_dsml_tool_calls()` parses the XML into standard OpenAI `tool_calls` dicts.
-5. The route handler re-emits them in the target API format (OpenAI `tool_calls` field, Anthropic `tool_use` blocks, Responses API `function_call` output items).
-
-This is entirely transparent to the calling SDK — it sees the same tool-call envelope it would from a native API.
-
----
-
-## Architecture
-
-At server startup, one DeepSeek chat and one Qwen chat are created. Their IDs
-remain unchanged and are reused for every request until the server stops.
-
-```
-Client
-  │
-  ▼
-FastAPI route handler
-  │  normalise request → messages list
-  │  inject DSML tool prompt into system message
-  │  _prepare_session() / _run_sync()
-  ▼
-Process-lifetime adapter chat ID
-DeepSeekAdapter.chat() or .chat_stream()    ← blocking; runs in thread pool
-  │
-  ▼  (streaming path)
-asyncio.Queue  ←  producer thread
-  │
-  ▼
-StreamSieve.feed(token)
-  │  text events  →  forwarded as SSE deltas
-  │  tool_calls events  →  buffered, emitted at end
-  ▼
-parse_dsml_tool_calls()
-  │
-  ▼
-Translated SSE envelope  →  Client
-```
-
-Blocking I/O from `DeepSeekAdapter` is isolated in a `run_in_executor` thread pool so the `asyncio` event loop stays unblocked during long streaming responses.
-
----
-
-## Authentication
-
-If `API_KEY` is set in the environment, every request must include:
-
-```
-Authorization: Bearer <your-API_KEY>
-```
-
-Leave `API_KEY` empty (or unset) to disable the guard for local use.
+No license file is currently included. Unless a license is added, standard
+copyright restrictions apply.
