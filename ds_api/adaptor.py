@@ -10,10 +10,15 @@ import time
 import struct
 import uuid
 import base64
+import datetime
+import hashlib
+import random
+import re
 import threading
 import httpx
 from dotenv import load_dotenv
 from wasmtime import Store, Module, Instance
+from base64 import b64encode
 
 load_dotenv()
 # deepseek conf
@@ -25,6 +30,15 @@ QWEN_TOKEN = os.environ.get("QWEN_TOKEN", "")
 QWEN_COOKIES = os.environ.get("QWEN_COOKIES", "")
 QWEN_BASE_URL = "https://chat.qwen.ai"
 DEFAULT_QWEN_MODEL = "qwen3.7-plus"
+# chatgpt conf
+CHATGPT_BASE_URL = "https://chatgpt.com"
+CHATGPT_TOKEN = os.environ.get("CHATGPT_TOKEN", "")
+CHATGPT_COOKIES = (
+    os.environ.get("CHATGPT_COOKIES", "")
+    or os.environ.get("CHATGPT_COOKIE_PART_1", "")
+    + os.environ.get("CHATGPT_COOKIE_PART_2", "")
+)
+DEFAULT_CHATGPT_MODEL = "auto"
 
 with open("ds_api/sha3_wasm_bg.wasm", "rb") as f:
     _WASM_BYTES = f.read()
@@ -32,10 +46,8 @@ with open("ds_api/sha3_wasm_bg.wasm", "rb") as f:
 class WASMError(Exception):
     pass
 
-
 class PoWError(Exception):
     pass
-
 
 class _WASMSolver:
     """WASM-based PoW solver (reused across calls) — thread-safe via lock."""
@@ -89,7 +101,6 @@ class _WASMSolver:
                 return int(result)
             finally:
                 self._free_allocations()
-
 
 class DeepSeekAdapter:
     """Adapter for DeepSeek Chat API"""
@@ -648,3 +659,362 @@ class QwenAdapter:
  
         if new_msg_id:
             self._parent_ids[session_id] = new_msg_id
+
+class ChatGPTAdapter:
+    """Adapter for chatgpt.com's internal conversation API."""
+
+    def __init__(
+        self,
+        token: str | None = CHATGPT_TOKEN,
+        cookies: str = CHATGPT_COOKIES,
+    ):
+        self.token = token or None
+        self.cookies = cookies
+        self.user_agent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36 Edg/148.0.0.0'
+        self.session_max_messages = max(1, 50)
+        self.session_ttl_seconds = max(1, 3 * 60 * 60)
+        self._client = httpx.Client(timeout=120)
+        self._sessions: dict[str, dict] = {}
+        self._token_expiry = 0.0
+        self._scripts_cache: dict | None = None
+        self._lock = threading.RLock()
+
+    def _headers(self, *, authorized: bool = False) -> dict[str, str]:
+        headers = {
+            "accept": "*/*",
+            "accept-encoding": "application/json;",
+            "accept-language": "en-US,en;q=0.9,en-IN;q=0.8",
+            "cookie": self.cookies,
+            "oai-client-build-number": "6844271",
+            "oai-client-version": "prod-8117aba90ffac2b43c6118f2fc2eefaac58f816d",
+            "origin": CHATGPT_BASE_URL,
+            "referer": f"{CHATGPT_BASE_URL}/",
+            "sec-fetch-dest": "empty",
+            "sec-fetch-mode": "cors",
+            "sec-fetch-site": "same-origin",
+            "user-agent": self.user_agent,
+        }
+
+        if authorized:
+            headers["Authorization"] = f"Bearer {self._get_token()}"
+        return headers
+
+    def _get_token(self) -> str:
+        with self._lock:
+            if self.token and (
+                self._token_expiry == 0 or time.time() < self._token_expiry
+            ):
+                return self.token
+            if not self.cookies:
+                raise RuntimeError("Set CHATGPT_COOKIES")
+
+            response = self._client.get(
+                f"{CHATGPT_BASE_URL}/api/auth/session",
+                headers=self._headers(),
+            )
+            response.raise_for_status()
+            data = response.json()
+            access_token = data.get("accessToken")
+            if not access_token:
+                raise RuntimeError("Not logged in. Check your ChatGPT cookies.")
+            self.token = access_token
+            self._token_expiry = time.time() + 300
+            return access_token
+
+    def _get_scripts_and_dpl(self) -> dict:
+        with self._lock:
+            if self._scripts_cache is not None:
+                return self._scripts_cache
+            try:
+                response = self._client.get(
+                    f"{CHATGPT_BASE_URL}/",
+                    headers=self._headers(),
+                )
+                response.raise_for_status()
+                scripts = re.findall(r'src="([^"]*)"', response.text)
+                match = re.search(r"dpl=([a-zA-Z0-9_-]+)", response.text)
+                self._scripts_cache = {
+                    "scripts": scripts or [None],
+                    "dpl": match.group(1) if match else "",
+                }
+            except httpx.HTTPError:
+                self._scripts_cache = {"scripts": [None], "dpl": ""}
+            return self._scripts_cache
+
+    def _solve_pow(
+        self,
+        seed: str,
+        difficulty: str,
+        scripts: list[str | None] | None,
+        dpl: str,
+    ) -> str | None:
+        start_time = time.time()
+        navigator = {
+            "appCodeName": "Mozilla",
+            "appName": "Netscape",
+            "appVersion": "5.0 (Windows NT 10.0; Win64; x64)",
+            "cookieEnabled": True,
+            "language": "en-US",
+            "languages": ["en-US", "en"],
+            "platform": "Win32",
+            "userAgent": self.user_agent,
+            "vendor": "Google Inc.",
+            "hardwareConcurrency": 8,
+        }
+        navigator_key = random.choice(list(navigator))
+        config = [
+            navigator["hardwareConcurrency"] + 1920 + 1080,
+            datetime.datetime.now().ctime(),
+            4294705152,
+            0,
+            self.user_agent,
+            random.choice(scripts or [None]),
+            dpl or "",
+            navigator["language"],
+            ",".join(navigator["languages"]),
+            0,
+            f"{navigator_key}-{navigator[navigator_key]}",
+            random.choice(["location", "cookie", "title", "createElement"]),
+            random.choice(["fetch", "setTimeout", "console", "document"]),
+            int(time.time() * 1000),
+            str(uuid.uuid4()),
+        ]
+
+        for nonce in range(1, 100000):
+            config[3] = nonce
+            config[9] = round((time.time() - start_time) * 1000)
+            encoded = base64.b64encode(
+                json.dumps(config).encode("utf-8")
+            ).decode("ascii")
+            digest = hashlib.sha3_512((seed + encoded).encode()).hexdigest()
+            if digest[:len(difficulty)] <= difficulty:
+                return encoded
+        return None
+
+    def _get_requirements_and_pow(self) -> dict[str, str]:
+        headers = self._headers(authorized=True)
+        headers["Content-Type"] = "application/json"
+        response = self._client.post(
+            f"{CHATGPT_BASE_URL}/backend-api/sentinel/chat-requirements",
+            headers=headers,
+            json={"conversation_mode_kind": "primary_assistant"},
+        )
+        response.raise_for_status()
+        requirements = response.json()
+        result = {}
+        if requirements.get("token"):
+            result["requirementsToken"] = requirements["token"]
+
+        proof = requirements.get("proofofwork") or {}
+        if proof.get("required"):
+            script_data = self._get_scripts_and_dpl()
+            proof_token = self._solve_pow(
+                proof["seed"],
+                proof["difficulty"],
+                script_data.get("scripts"),
+                script_data.get("dpl", ""),
+            )
+            if not proof_token:
+                raise RuntimeError("Unable to solve ChatGPT proof-of-work challenge.")
+            result["proofToken"] = f"gAAAAAB{proof_token}"
+        return result
+
+    @staticmethod
+    def _new_session_state() -> dict:
+        now = time.time()
+        return {
+            "conversation_id": None,
+            "parent_message_id": None,
+            "message_count": 0,
+            "created_at": now,
+            "last_used_at": now,
+        }
+
+    def create_session(self, model: str = DEFAULT_CHATGPT_MODEL) -> str:
+        """Create a local session; ChatGPT creates its conversation on first use."""
+        del model
+        session_id = str(uuid.uuid4())
+        with self._lock:
+            self._sessions[session_id] = self._new_session_state()
+        return session_id
+
+    def _session_for_request(self, session_id: str) -> dict:
+        with self._lock:
+            session = self._sessions.get(session_id)
+            now = time.time()
+            if (
+                not session
+                or session["message_count"] >= self.session_max_messages
+                or now - session["created_at"] >= self.session_ttl_seconds
+            ):
+                session = self._new_session_state()
+                self._sessions[session_id] = session
+            return session.copy()
+
+    @staticmethod
+    def _iter_sse_data(response: httpx.Response):
+        data_lines = []
+        for raw_line in response.iter_lines():
+            line = raw_line.rstrip("\r")
+            if not line:
+                if data_lines:
+                    yield "".join(data_lines)
+                    data_lines = []
+                continue
+            if line.startswith("data:"):
+                data_lines.append(line[5:].lstrip())
+        if data_lines:
+            yield "".join(data_lines)
+
+    def _conversation_headers(self) -> dict[str, str]:
+        proof_data = self._get_requirements_and_pow()
+        headers = self._headers(authorized=True)
+        headers.update({
+            "Accept": "text/event-stream",
+            "Content-Type": "application/json",
+            "OAI-Language": "en-US",
+        })
+        device_match = re.search(r"(?:^|;\s*)oai-did=([^;]+)", self.cookies)
+        if device_match:
+            headers["OAI-Device-Id"] = device_match.group(1)
+        if proof_data.get("requirementsToken"):
+            headers["Openai-Sentinel-Chat-Requirements-Token"] = (
+                proof_data["requirementsToken"]
+            )
+        if proof_data.get("proofToken"):
+            headers["Openai-Sentinel-Proof-Token"] = proof_data["proofToken"]
+        return headers
+
+    @staticmethod
+    def _build_body(session: dict, prompt: str, model: str) -> dict:
+        offset = datetime.datetime.now().astimezone().utcoffset()
+        payload = {
+            "action": "next",
+            "messages": [{
+                "id": str(uuid.uuid4()),
+                "author": {"role": "user"},
+                "content": {"content_type": "text", "parts": [prompt]},
+                "metadata": {},
+            }],
+            "model": model,
+            "parent_message_id": (
+                session.get("parent_message_id") or str(uuid.uuid4())
+            ),
+            "timezone_offset_min": int(offset.total_seconds() // 60) if offset else 0,
+            "history_and_training_disabled": False,
+            "conversation_mode": {"kind": "primary_assistant"},
+            "force_paragen": False,
+            "force_nulligen": False,
+            "force_rate_limit": False,
+        }
+        if session.get("conversation_id"):
+            payload["conversation_id"] = session["conversation_id"]
+        return payload
+
+    def chat(
+        self,
+        session_id: str,
+        prompt: str,
+        model_type: str | None = None,
+        thinking_enabled: bool = False,
+        search_enabled: bool = False,
+    ) -> str:
+        """Send a message and collect the streamed response."""
+        return "".join(
+            token for token in self.chat_stream(
+                session_id,
+                prompt,
+                model_type=model_type,
+                thinking_enabled=thinking_enabled,
+                search_enabled=search_enabled,
+            )
+            if isinstance(token, str)
+        )
+
+    def chat_stream(
+        self,
+        session_id: str,
+        prompt: str,
+        model_type: str | None = None,
+        thinking_enabled: bool = False,
+        search_enabled: bool = False,
+    ):
+        """Stream text deltas from ChatGPT's cumulative SSE messages."""
+        del thinking_enabled, search_enabled
+        if not self.cookies and not self.token:
+            raise RuntimeError(
+                "Set CHATGPT_COOKIES or CHATGPT_COOKIE_PART_1/"
+                "CHATGPT_COOKIE_PART_2."
+            )
+
+        session = self._session_for_request(session_id)
+        payload = self._build_body(
+            session, prompt, model_type or DEFAULT_CHATGPT_MODEL
+        )
+        headers = self._conversation_headers()
+        full_content = ""
+        conversation_id = session.get("conversation_id")
+        assistant_message_id = None
+
+        with self._client.stream(
+            "POST",
+            f"{CHATGPT_BASE_URL}/backend-api/conversation",
+            headers=headers,
+            json=payload,
+            timeout=None,
+        ) as response:
+            if response.status_code >= 400:
+                response.read()
+                if (
+                    response.status_code == 404
+                    and "conversation_deleted" in response.text
+                ):
+                    with self._lock:
+                        self._sessions[session_id] = self._new_session_state()
+                response.raise_for_status()
+
+            if "application/json" in response.headers.get("content-type", ""):
+                response.read()
+                raise RuntimeError(
+                    f"Unexpected ChatGPT JSON response: {response.text}"
+                )
+
+            for event_data in self._iter_sse_data(response):
+                if event_data == "[DONE]":
+                    break
+                try:
+                    event = json.loads(event_data)
+                except json.JSONDecodeError:
+                    continue
+
+                conversation_id = event.get("conversation_id") or conversation_id
+                message = event.get("message") or {}
+                assistant_message_id = message.get("id") or assistant_message_id
+                if (message.get("author") or {}).get("role") != "assistant":
+                    continue
+                parts = (message.get("content") or {}).get("parts")
+                if not isinstance(parts, list):
+                    continue
+
+                new_content = "".join(
+                    part for part in parts if isinstance(part, str)
+                )
+                delta = (
+                    new_content[len(full_content):]
+                    if new_content.startswith(full_content)
+                    else new_content
+                )
+                full_content = new_content
+                if delta:
+                    yield delta
+
+        if conversation_id:
+            with self._lock:
+                current = self._sessions.setdefault(
+                    session_id, self._new_session_state()
+                )
+                current["conversation_id"] = conversation_id
+                if assistant_message_id:
+                    current["parent_message_id"] = assistant_message_id
+                current["message_count"] += 1
+                current["last_used_at"] = time.time()

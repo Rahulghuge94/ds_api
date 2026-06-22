@@ -1,11 +1,11 @@
 {
   "env": {
-    "ANTHROPIC_BASE_URL": "http://localhost:8000/qwen",
-    "ANTHROPIC_API_KEY": "any",
-    "ANTHROPIC_MODEL": "qwen3.7-plus",
+    "ANTHROPIC_BASE_URL": "http://localhost:8000/chatgpt",
+    "ANTHROPIC_API_KEY": "asdfghjkl",
+    "ANTHROPIC_MODEL": "gpt-5-5",
     "ENABLE_TOOL_SEARCH": "true"
   },
   "autoUpdatesChannel": "latest",
   "theme": "dark",
-  "model": "qwen3.7-plus"
+  "model": "gpt-5-5"
 }

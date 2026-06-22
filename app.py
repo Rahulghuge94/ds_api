@@ -58,7 +58,7 @@ import ds_api.adaptor as _adaptor_mod
 with open(_WASM_PATH, "rb") as _wf:
     _adaptor_mod._WASM_BYTES = _wf.read()
 
-from ds_api.adaptor import DeepSeekAdapter, QwenAdapter
+from ds_api.adaptor import ChatGPTAdapter, DeepSeekAdapter, QwenAdapter
 from ds_api.tool_dsml import (                       
     parse_dsml_tool_calls,
     build_dsml_tool_prompt,
@@ -67,7 +67,9 @@ from ds_api.tool_sieve import StreamSieve
 
 ds_adapter: DeepSeekAdapter | None = None
 qw_adapter: QwenAdapter | None = None
-AdapterName = Literal["ds", "qwen"]
+chatgpt_adapter: ChatGPTAdapter | None = None
+Adapter = DeepSeekAdapter | QwenAdapter | ChatGPTAdapter
+AdapterName = Literal["ds", "qwen", "chatgpt"]
 _upstream_chat_ids: dict[AdapterName, str] = {}
 
 # Configure logger to save to a file
@@ -80,17 +82,58 @@ logging.basicConfig(
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global ds_adapter, qw_adapter
+    global ds_adapter, qw_adapter, chatgpt_adapter
 
-    ds_adapter = DeepSeekAdapter()
-    qw_adapter = QwenAdapter()
-    try:
-        ds_chat_id, qw_chat_id = await asyncio.gather(
-            _run_sync(ds_adapter.create_session),
-            _run_sync(qw_adapter.create_session),
+    ds_adapter = DeepSeekAdapter() if os.getenv("DEEPSEEK_COOKIES", "").strip() else None
+    qw_adapter = QwenAdapter() if os.getenv("QWEN_COOKIES", "").strip() else None
+    chatgpt_cookies = (
+        os.getenv("CHATGPT_COOKIES", "")
+        or (
+            os.getenv("CHATGPT_COOKIE_PART_1", "")
+            + os.getenv("CHATGPT_COOKIE_PART_2", "")
         )
-        _upstream_chat_ids["ds"] = ds_chat_id
-        _upstream_chat_ids["qwen"] = qw_chat_id
+    ).strip()
+    chatgpt_adapter = ChatGPTAdapter() if chatgpt_cookies else None
+
+    try:
+        configured_adapters: dict[AdapterName, Adapter] = {}
+        if ds_adapter:
+            configured_adapters["ds"] = ds_adapter
+        if qw_adapter:
+            configured_adapters["qwen"] = qw_adapter
+        if chatgpt_adapter:
+            configured_adapters["chatgpt"] = chatgpt_adapter
+
+        if configured_adapters:
+            session_results = await asyncio.gather(
+                *(
+                    _run_sync(adapter.create_session)
+                    for adapter in configured_adapters.values()
+                ),
+                return_exceptions=True,
+            )
+            for name, adapter, result in zip(
+                configured_adapters,
+                configured_adapters.values(),
+                session_results,
+            ):
+                if isinstance(result, BaseException):
+                    logging.error(
+                        "Failed to initialize %s adapter: %s",
+                        name,
+                        result,
+                    )
+                    if adapter._client:
+                        adapter._client.close()
+                    if name == "ds":
+                        ds_adapter = None
+                    elif name == "qwen":
+                        qw_adapter = None
+                    else:
+                        chatgpt_adapter = None
+                    continue
+                _upstream_chat_ids[name] = result
+
         yield
     finally:
         _upstream_chat_ids.clear()
@@ -98,11 +141,14 @@ async def lifespan(app: FastAPI):
             ds_adapter._client.close()
         if qw_adapter and qw_adapter._client:
             qw_adapter._client.close()
+        if chatgpt_adapter and chatgpt_adapter._client:
+            chatgpt_adapter._client.close()
     
 app = FastAPI(
-    title="DS/QW Proxy",
+    title="DS/Qwen/ChatGPT Proxy",
     description=(
-        "OpenAI / Anthropic / Codex compatible interface over DS/QW Chat "
+        "OpenAI / Anthropic / Codex compatible interface over "
+        "DeepSeek, Qwen, and ChatGPT "
         "with DSML tool-call support."
     ),
     version="1.0.0",
@@ -154,8 +200,13 @@ def _check_auth(
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED,
                             detail="Invalid or missing API key")
 
-def _get_adapter(name: AdapterName) -> DeepSeekAdapter | QwenAdapter:
-    _adapter = qw_adapter if name == "qwen" else ds_adapter
+def _get_adapter(name: AdapterName) -> Adapter:
+    adapters: dict[AdapterName, Adapter | None] = {
+        "ds": ds_adapter,
+        "qwen": qw_adapter,
+        "chatgpt": chatgpt_adapter,
+    }
+    _adapter = adapters[name]
     
     if _adapter is None:
         raise HTTPException(500, "Adapter not initialised")
@@ -183,6 +234,10 @@ def _model_settings(
     model_type, thinking_enabled, search_enabled = _model_to_ds(model)
     if adapter_name == "qwen":
         model_type = model if model.lower().startswith("qwen") else None
+    elif adapter_name == "chatgpt":
+        model_type = model or "auto"
+        thinking_enabled = False
+        search_enabled = False
     return model_type, thinking_enabled, search_enabled
 
 async def _create_session(
@@ -190,7 +245,7 @@ async def _create_session(
     model_type: str | None = None,
 ) -> str:
     adapter = _get_adapter(adapter_name)
-    if adapter_name == "qwen" and model_type:
+    if adapter_name in ("qwen", "chatgpt") and model_type:
         return await _run_sync(adapter.create_session, model_type)
     return await _run_sync(adapter.create_session)
 
@@ -236,11 +291,34 @@ def _content_to_text(content: Any) -> str:
     if isinstance(content, str):
         return content
     if isinstance(content, list):
-        return " ".join(
-            part.get("text", "")
-            for part in content
-            if isinstance(part, dict) and part.get("type") == "text"
-        )
+        rendered = []
+        for part in content:
+            if not isinstance(part, dict):
+                rendered.append(str(part))
+                continue
+            part_type = part.get("type")
+            if part_type == "text":
+                rendered.append(part.get("text", ""))
+            elif part_type == "tool_use":
+                rendered.append(
+                    "[Tool call "
+                    f"id={part.get('id', '')} "
+                    f"name={part.get('name', '')} "
+                    f"input={json.dumps(part.get('input', {}), ensure_ascii=False)}]"
+                )
+            elif part_type == "tool_result":
+                result_content = part.get("content", "")
+                if isinstance(result_content, list):
+                    result_content = _content_to_text(result_content)
+                elif not isinstance(result_content, str):
+                    result_content = json.dumps(result_content, ensure_ascii=False)
+                status = "error" if part.get("is_error") else "success"
+                rendered.append(
+                    "[Tool result "
+                    f"id={part.get('tool_use_id', '')} "
+                    f"status={status}]\n{result_content}"
+                )
+        return "\n".join(part for part in rendered if part)
     return str(content)
 
 def _messages_to_prompt(messages: list[dict]) -> str:
@@ -424,7 +502,7 @@ class ResponsesRequest(BaseModel):
     conversation_id: Optional[str] = None
 
 async def _token_queue(
-    adapter: DeepSeekAdapter | QwenAdapter,
+    adapter: Adapter,
     session_id: str,
     prompt: str,
     model_type: str | None,
@@ -1006,8 +1084,18 @@ _QWEN_MODELS = [
     {"id": "qwen3.7-plus", "object": "model", "created": 0, "owned_by": "qwen"},
 ]
 
+_CHATGPT_MODELS = [
+    {"id": "auto", "object": "model", "created": 0, "owned_by": "openai"},
+    {"id": "gpt-5-5", "object": "model", "created": 0, "owned_by": "openai"},
+    {"id": "gpt-4o", "object": "model", "created": 0, "owned_by": "openai"},
+]
+
 def _models_for(adapter_name: AdapterName) -> list[dict]:
-    return _QWEN_MODELS if adapter_name == "qwen" else _DS_MODELS
+    if adapter_name == "qwen":
+        return _QWEN_MODELS
+    if adapter_name == "chatgpt":
+        return _CHATGPT_MODELS
+    return _DS_MODELS
 
 @app.get("/{adapter_name}/v1/models", dependencies=[Depends(_check_auth)])
 async def list_models(adapter_name: AdapterName):
@@ -1022,10 +1110,16 @@ async def get_model(adapter_name: AdapterName, model_id: str):
 
 @app.get("/{adapter_name}/health")
 async def health(adapter_name: AdapterName):
+    adapters: dict[AdapterName, Adapter | None] = {
+        "ds": ds_adapter,
+        "qwen": qw_adapter,
+        "chatgpt": chatgpt_adapter,
+    }
+    ready = adapters[adapter_name] is not None and adapter_name in _upstream_chat_ids
     return {
-        "status": "ok",
+        "status": "ok" if ready else "unavailable",
         "adapter": adapter_name,
-        "adapter_ready": _get_adapter(adapter_name) is not None,
+        "adapter_ready": ready,
     }
 
 if __name__ == "__main__":

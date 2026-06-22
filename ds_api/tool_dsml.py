@@ -268,5 +268,21 @@ Available tools:
         fn = tool.get("function", {})
         name = fn.get("name") or tool.get("name", "")
         desc = (fn.get("description") or tool.get("description", "")).split("\n")[0].strip()
-        prompt += f"  - {name}: {desc}\n" if desc and name else f"  - {name}\n"
+        schema = (
+            fn.get("parameters")
+            or tool.get("input_schema")
+            or tool.get("parameters")
+            or {"type": "object", "properties": {}}
+        )
+        if not name:
+            continue
+        prompt += f"  - {name}"
+        if desc:
+            prompt += f": {desc}"
+        prompt += "\n"
+        prompt += (
+            "    Input schema: "
+            + json.dumps(schema, ensure_ascii=False, separators=(",", ":"))
+            + "\n"
+        )
     return prompt.strip()
