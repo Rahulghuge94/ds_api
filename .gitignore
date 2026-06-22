@@ -5,3 +5,5 @@ settings.local.json
 */__pycache__/
 *.py[cod]
 app.log
+run.bat
+run.sh

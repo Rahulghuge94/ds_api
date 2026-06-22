@@ -1,0 +1,9 @@
+@echo off
+:: Navigate to your project directory
+cd /d "C:\path\to\your\project"
+
+:: Activate your virtual environment (if you are using one then un-comment below)
+:: call "C:\path\to\your\project\venv\Scripts\activate.bat"
+
+:: Run Uvicorn
+uvicorn app:app --host 0.0.0.0 --port 8000 --reload
